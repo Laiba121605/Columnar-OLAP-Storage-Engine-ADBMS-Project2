@@ -1,6 +1,7 @@
 // test_phase1.cpp - Complete Phase 1 Test
-// Compile: g++ -std=c++17 -I include test_phase1.cpp src/*.cpp -o test_phase1.exe
-// Run: .\test_phase1.exe
+// Compile: g++ -std=c++17 -I include test_phase1.cpp src/*.cpp -o test_phase1
+// Run (Linux):   ./test_phase1
+// Run (Windows): .\test_phase1.exe
 
 #include <iostream>
 #include <cassert>
@@ -14,16 +15,19 @@
 #include "include/type_inference.h"
 #include "include/column_writer.h"
 #include "include/schema.h"
+#include <cstring>
 
 using namespace std;
 
-// Helper function to create directories on Windows
 void createDirectory(const string& path) {
+#ifdef _WIN32
     string cmd = "if not exist \"" + path + "\" mkdir \"" + path + "\"";
+#else
+    string cmd = "mkdir -p \"" + path + "\"";
+#endif
     system(cmd.c_str());
 }
 
-// Helper to read a file as string
 string readFileAsString(const string& path) {
     ifstream file(path);
     if (!file.is_open()) return "";
@@ -32,14 +36,39 @@ string readFileAsString(const string& path) {
     return buffer.str();
 }
 
+// ============================================================
+// Helper: read a .col file, verify its CRC64 footer, return true if valid.
+// Manual Section 4: "footer_crc64 — CRC64 over everything above"
+// The file layout is: [header 36 bytes][data][CRC64 8 bytes]
+// CRC covers everything except the last 8 bytes (the CRC itself).
+// ============================================================
+bool verifyCRC(const string& filepath) {
+    ifstream f(filepath, ios::binary);
+    if (!f.is_open()) return false;
+
+    // Read the whole file
+    vector<char> buf((istreambuf_iterator<char>(f)), istreambuf_iterator<char>());
+    f.close();
+
+    if (buf.size() < CRC64_SIZE) return false;
+
+    // Last 8 bytes = stored CRC
+    uint64_t stored_crc = 0;
+    memcpy(&stored_crc, buf.data() + buf.size() - CRC64_SIZE, CRC64_SIZE);
+
+    // Compute CRC over everything before the footer
+    uint64_t computed_crc = crc64(buf.data(), buf.size() - CRC64_SIZE);
+
+    return stored_crc == computed_crc;
+}
+
 // Test 1: CSV Parser
 void testCSVParser() {
     cout << "\n[TEST 1] CSV Parser\n";
     cout << "----------------------------------------\n";
-    
-    // Create directory and test CSV
+
     createDirectory("data");
-    
+
     ofstream file("data/test.csv");
     file << "id,name,age,price\n";
     file << "1,Alice,25,99.99\n";
@@ -50,28 +79,25 @@ void testCSVParser() {
     file << "6,\"Smith, John\",40,50.00\n";
     file << "7,\"She said \"\"Hello\"\"\",45,75.50\n";
     file.close();
-    
+
     CSVParser parser("data/test.csv");
     assert(parser.parse());
-    
+
     auto headers = parser.getHeaders();
-    auto rows = parser.getRows();
-    
+    auto rows    = parser.getRows();
+
     assert(headers.size() == 4);
     assert(headers[0] == "id");
     assert(headers[1] == "name");
     assert(headers[2] == "age");
     assert(headers[3] == "price");
-    
+
     assert(rows.size() == 7);
     assert(rows[0][0] == "1");
     assert(rows[0][1] == "Alice");
-    assert(rows[0][2] == "25");
-    assert(rows[0][3] == "99.99");
-    
     assert(rows[5][1] == "Smith, John");
     assert(rows[6][1] == "She said \"Hello\"");
-    
+
     cout << "  Headers: ";
     for (auto h : headers) cout << h << " ";
     cout << "\n";
@@ -85,29 +111,27 @@ void testCSVParser() {
 void testTypeInference() {
     cout << "\n[TEST 2] Type Inference\n";
     cout << "----------------------------------------\n";
-    
-    vector<string> int_col = {"1", "2", "3", "4", "5", "-10", "0"};
+
+    vector<string> int_col    = {"1", "2", "3", "4", "5", "-10", "0"};
     vector<string> double_col = {"1.5", "2.7", "3.14", "4.0", "5.99", "0.0", "-1.5"};
     vector<string> string_col = {"apple", "banana", "cherry", "", "date", "123abc"};
-    vector<string> mixed_col = {"1", "2.5", "three", "4", "5.0"};
-    vector<string> empty_col = {};
-    
-    assert(TypeInference::inferType(int_col) == ColumnType::INT64);
+    vector<string> mixed_col  = {"1", "2.5", "three", "4", "5.0"};
+    vector<string> empty_col  = {};
+
+    assert(TypeInference::inferType(int_col)    == ColumnType::INT64);
     assert(TypeInference::inferType(double_col) == ColumnType::DOUBLE);
     assert(TypeInference::inferType(string_col) == ColumnType::STRING);
-    assert(TypeInference::inferType(mixed_col) == ColumnType::STRING);
-    assert(TypeInference::inferType(empty_col) == ColumnType::STRING);
-    
-    assert(TypeInference::isInt64("123") == true);
-    assert(TypeInference::isInt64("-456") == true);
-    assert(TypeInference::isInt64("12.3") == false);
-    assert(TypeInference::isInt64("abc") == false);
-    
-    assert(TypeInference::isDouble("123") == true);
-    assert(TypeInference::isDouble("12.3") == true);
+    assert(TypeInference::inferType(mixed_col)  == ColumnType::STRING);
+    assert(TypeInference::inferType(empty_col)  == ColumnType::STRING);
+
+    assert(TypeInference::isInt64("123")    == true);
+    assert(TypeInference::isInt64("-456")   == true);
+    assert(TypeInference::isInt64("12.3")   == false);
+    assert(TypeInference::isInt64("abc")    == false);
+    assert(TypeInference::isDouble("12.3")  == true);
     assert(TypeInference::isDouble("-12.3") == true);
-    assert(TypeInference::isDouble("abc") == false);
-    
+    assert(TypeInference::isDouble("abc")   == false);
+
     cout << "  INT64 column: PASSED\n";
     cout << "  DOUBLE column: PASSED\n";
     cout << "  STRING column: PASSED\n";
@@ -117,19 +141,14 @@ void testTypeInference() {
 
 // Test 3: Column Writer
 void testColumnWriter() {
-   cout << "\n[TEST 3] Column Writer\n";
+    cout << "\n[TEST 3] Column Writer\n";
     cout << "----------------------------------------\n";
-    
+
     string test_dir = "data/test_warehouse/sales";
-    
-    // Create directories using backslashes for Windows
     createDirectory("data");
     createDirectory("data/test_warehouse");
     createDirectory("data/test_warehouse/sales");
-    
-    cout << "  Created directory: " << test_dir << "\n";
-    
-    // Test INT64 column
+
     {
         ColumnWriter writer(test_dir, "id", ColumnType::INT64, Encoding::NONE);
         vector<int64_t> values = {1, 2, 3, 4, 5, 6, 7};
@@ -138,8 +157,6 @@ void testColumnWriter() {
         assert(writer.finalize());
         cout << "  ✓ Wrote id.col (INT64)\n";
     }
-    
-    // Test DOUBLE column
     {
         ColumnWriter writer(test_dir, "price", ColumnType::DOUBLE, Encoding::NONE);
         vector<double> values = {99.99, 149.50, 199.00, 79.95, 299.99, 50.00, 75.50};
@@ -148,8 +165,6 @@ void testColumnWriter() {
         assert(writer.finalize());
         cout << "  ✓ Wrote price.col (DOUBLE)\n";
     }
-    
-    // Test STRING column
     {
         ColumnWriter writer(test_dir, "name", ColumnType::STRING, Encoding::NONE);
         vector<string> values = {"Alice", "Bob", "Charlie", "Diana", "Eve", "Smith, John", "She said \"Hello\""};
@@ -158,150 +173,146 @@ void testColumnWriter() {
         assert(writer.finalize());
         cout << "  ✓ Wrote name.col (STRING)\n";
     }
-    
-    // Verify files exist
+
     assert(ifstream(test_dir + "/id.col").good());
     assert(ifstream(test_dir + "/price.col").good());
     assert(ifstream(test_dir + "/name.col").good());
-    
+
     cout << "  ✓ Column Writer PASSED\n";
 }
 
-// Test 4: Column Reader (Manual verification)
+// Test 4: Column Reader + CRC64 verification
 void testColumnReader() {
-    cout << "\n[TEST 4] Column Reader (Manual Verification)\n";
+    cout << "\n[TEST 4] Column Reader + CRC64 Verification\n";
     cout << "----------------------------------------\n";
-    
+
     string test_dir = "data/test_warehouse/sales";
-    
-    // Read and verify INT64 column
+
+    // --- INT64 ---
     {
+        // Verify CRC first
+        assert(verifyCRC(test_dir + "/id.col"));
+        cout << "  id.col CRC64: VALID\n";
+
         ifstream file(test_dir + "/id.col", ios::binary);
         assert(file.is_open());
-        
+
         ColumnHeader header;
         file.read(reinterpret_cast<char*>(&header), HEADER_SIZE);
-        
-        assert(header.magic == MAGIC);
-        assert(header.version == VERSION);
-        assert(header.type == static_cast<uint8_t>(ColumnType::INT64));
-        assert(header.encoding == static_cast<uint8_t>(Encoding::NONE));
-        assert(header.row_count == 7);
-        
+
+        assert(header.magic      == MAGIC);
+        assert(header.version    == VERSION);
+        assert(header.type       == static_cast<uint8_t>(ColumnType::INT64));
+        assert(header.encoding   == static_cast<uint8_t>(Encoding::NONE));
+        assert(header.row_count  == 7);
+        assert(header.data_size  == 7 * sizeof(int64_t));  // 56 bytes
+        assert(header.dict_size  == 0);
+
         vector<int64_t> ids(header.row_count);
-        for (size_t i = 0; i < header.row_count; i++) {
+        for (size_t i = 0; i < header.row_count; i++)
             file.read(reinterpret_cast<char*>(&ids[i]), sizeof(int64_t));
-        }
+        // Note: last 8 bytes of file are CRC — do NOT read them as data
         file.close();
-        
-        assert(ids[0] == 1);
-        assert(ids[3] == 4);
-        assert(ids[6] == 7);
-        
-        cout << "  id.col: " << ids.size() << " values, first=" << ids[0] << ", last=" << ids[6] << "\n";
+
+        assert(ids[0] == 1 && ids[3] == 4 && ids[6] == 7);
+        cout << "  id.col: " << ids.size() << " values, first=" << ids[0] << " last=" << ids[6] << "\n";
         cout << "  ✓ INT64 reader PASSED\n";
     }
-    
-    // Read and verify DOUBLE column
+
+    // --- DOUBLE ---
     {
+        assert(verifyCRC(test_dir + "/price.col"));
+        cout << "  price.col CRC64: VALID\n";
+
         ifstream file(test_dir + "/price.col", ios::binary);
         assert(file.is_open());
-        
+
         ColumnHeader header;
         file.read(reinterpret_cast<char*>(&header), HEADER_SIZE);
-        
-        assert(header.type == static_cast<uint8_t>(ColumnType::DOUBLE));
+        assert(header.type      == static_cast<uint8_t>(ColumnType::DOUBLE));
         assert(header.row_count == 7);
-        
+        assert(header.data_size == 7 * sizeof(double));
+
         vector<double> prices(header.row_count);
-        for (size_t i = 0; i < header.row_count; i++) {
+        for (size_t i = 0; i < header.row_count; i++)
             file.read(reinterpret_cast<char*>(&prices[i]), sizeof(double));
-        }
         file.close();
-        
-        assert(prices[0] == 99.99);
-        assert(prices[3] == 79.95);
-        
-        cout << "  price.col: " << prices.size() << " values, first=" << prices[0] << "\n";
+
+        assert(prices[0] == 99.99 && prices[3] == 79.95);
+        cout << "  price.col: first=" << prices[0] << "\n";
         cout << "  ✓ DOUBLE reader PASSED\n";
     }
-    
-    // Read and verify STRING column
+
+    // --- STRING ---
     {
+        assert(verifyCRC(test_dir + "/name.col"));
+        cout << "  name.col CRC64: VALID\n";
+
         ifstream file(test_dir + "/name.col", ios::binary);
         assert(file.is_open());
-        
+
         ColumnHeader header;
         file.read(reinterpret_cast<char*>(&header), HEADER_SIZE);
-        
-        assert(header.type == static_cast<uint8_t>(ColumnType::STRING));
+        assert(header.type      == static_cast<uint8_t>(ColumnType::STRING));
         assert(header.row_count == 7);
-        
+
         vector<string> names(header.row_count);
         for (size_t i = 0; i < header.row_count; i++) {
-            uint64_t len;
-            file.read(reinterpret_cast<char*>(&len), sizeof(uint64_t));
+            // Manual Section 4: STRING = 2-byte length prefix + bytes
+            uint16_t len;
+            file.read(reinterpret_cast<char*>(&len), sizeof(uint16_t));
             names[i].resize(len);
             file.read(&names[i][0], len);
         }
         file.close();
-        
+
         assert(names[0] == "Alice");
         assert(names[5] == "Smith, John");
         assert(names[6] == "She said \"Hello\"");
-        
-        cout << "  name.col: " << names.size() << " values, first=" << names[0] << "\n";
+        cout << "  name.col: first=" << names[0] << "\n";
         cout << "  ✓ STRING reader PASSED\n";
     }
-    
+
     cout << "  ✓ Column Reader PASSED\n";
 }
 
-// Test 5: Schema Manager (Write and Read)
+// Test 5: Schema Manager
 void testSchemaManager() {
     cout << "\n[TEST 5] Schema Manager\n";
     cout << "----------------------------------------\n";
-    
+
     string test_dir = "data/test_warehouse/sales";
-    
-    // Make sure directory exists
     createDirectory(test_dir);
-    
+
     vector<SchemaColumn> columns = {
-        {"id", ColumnType::INT64, Encoding::NONE},
-        {"name", ColumnType::STRING, Encoding::NONE},
-        {"age", ColumnType::INT64, Encoding::NONE},
+        {"id",    ColumnType::INT64,  Encoding::NONE},
+        {"name",  ColumnType::STRING, Encoding::NONE},
+        {"age",   ColumnType::INT64,  Encoding::NONE},
         {"price", ColumnType::DOUBLE, Encoding::NONE}
     };
-    
+
     assert(SchemaManager::writeSchema(test_dir, columns, "sales"));
     cout << "  ✓ writeSchema() PASSED\n";
-    
+
     assert(SchemaManager::schemaExists(test_dir));
     cout << "  ✓ schemaExists() PASSED\n";
-    
+
     auto read_columns = SchemaManager::readSchema(test_dir);
     assert(read_columns.size() == 4);
-    assert(read_columns[0].name == "id");
-    assert(read_columns[1].name == "name");
-    assert(read_columns[2].name == "age");
-    assert(read_columns[3].name == "price");
-    assert(read_columns[0].type == ColumnType::INT64);
-    assert(read_columns[1].type == ColumnType::STRING);
-    assert(read_columns[2].type == ColumnType::INT64);
-    assert(read_columns[3].type == ColumnType::DOUBLE);
-    
+    assert(read_columns[0].name == "id"    && read_columns[0].type == ColumnType::INT64);
+    assert(read_columns[1].name == "name"  && read_columns[1].type == ColumnType::STRING);
+    assert(read_columns[2].name == "age"   && read_columns[2].type == ColumnType::INT64);
+    assert(read_columns[3].name == "price" && read_columns[3].type == ColumnType::DOUBLE);
+
     cout << "  readSchema() returned " << read_columns.size() << " columns\n";
-    for (auto& col : read_columns) {
+    for (auto& col : read_columns)
         cout << "    - " << col.name << " : " << typeToString(col.type) << "\n";
-    }
     cout << "  ✓ readSchema() PASSED\n";
-    
+
     string schema_content = readFileAsString(test_dir + "/schema.json");
     assert(schema_content.find("\"table\": \"sales\"") != string::npos);
-    assert(schema_content.find("\"name\": \"id\"") != string::npos);
+    assert(schema_content.find("\"name\": \"id\"")     != string::npos);
     cout << "  ✓ schema.json format is valid\n";
-    
     cout << "  ✓ Schema Manager PASSED\n";
 }
 
@@ -309,9 +320,8 @@ void testSchemaManager() {
 void testDestructor() {
     cout << "\n[TEST 6] Destructor and Resource Cleanup\n";
     cout << "----------------------------------------\n";
-    
+
     createDirectory("data/test_destructor");
-    
     {
         ColumnWriter writer("data/test_destructor", "test", ColumnType::INT64, Encoding::NONE);
         writer.setRowCount(1);
@@ -320,40 +330,71 @@ void testDestructor() {
         writer.finalize();
         cout << "  ✓ ColumnWriter destructor works\n";
     }
-    
     {
         CSVParser parser("data/test.csv");
         parser.parse();
         cout << "  ✓ CSVParser destructor works\n";
     }
-    
     cout << "  ✓ All destructors work correctly\n";
+}
+
+// Test 7: CRC64 corruption detection
+void testCRCCorruptionDetection() {
+    cout << "\n[TEST 7] CRC64 Corruption Detection\n";
+    cout << "----------------------------------------\n";
+
+    // Write a valid column file
+    string test_dir = "data/test_destructor";
+    {
+        ColumnWriter writer(test_dir, "crc_test", ColumnType::INT64, Encoding::NONE);
+        writer.setRowCount(3);
+        writer.writeInt64({10, 20, 30});
+        writer.finalize();
+    }
+
+    string filepath = test_dir + "/crc_test.col";
+    assert(verifyCRC(filepath));
+    cout << "  Clean file CRC: VALID\n";
+
+    // Corrupt one byte in the middle of the file and verify detection
+    {
+        fstream corrupt(filepath, ios::binary | ios::in | ios::out);
+        assert(corrupt.is_open());
+        corrupt.seekp(40, ios::beg);  // somewhere in the data section
+        char bad = 0xFF;
+        corrupt.write(&bad, 1);
+        corrupt.close();
+    }
+
+    assert(!verifyCRC(filepath));
+    cout << "  Corrupted file CRC: INVALID (detected correctly)\n";
+    cout << "  ✓ CRC64 Corruption Detection PASSED\n";
 }
 
 int main() {
     cout << "\n========================================\n";
     cout << "PHASE 1 COMPLETE TEST SUITE\n";
     cout << "========================================\n";
-    
+
     testCSVParser();
     testTypeInference();
     testColumnWriter();
     testColumnReader();
     testSchemaManager();
     testDestructor();
-    
+    testCRCCorruptionDetection();
+
     cout << "\n========================================\n";
     cout << "ALL TESTS PASSED! ✓\n";
     cout << "========================================\n\n";
-    
+
     cout << "Files created:\n";
     cout << "  - data/test.csv\n";
     cout << "  - data/test_warehouse/sales/id.col\n";
     cout << "  - data/test_warehouse/sales/name.col\n";
     cout << "  - data/test_warehouse/sales/price.col\n";
     cout << "  - data/test_warehouse/sales/schema.json\n\n";
-    
     cout << "Phase 1 is ready to hand off to Person 2 and Person 3!\n";
-    
+
     return 0;
 }

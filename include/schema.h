@@ -7,18 +7,16 @@
 
 struct SchemaColumn {
     std::string name;
-    ColumnType type;
-    Encoding encoding;
+    ColumnType  type;
+    Encoding    encoding;
 };
 
 class SchemaManager {
 public:
     static bool writeSchema(const std::string& table_dir,
-                           const std::vector<SchemaColumn>& columns,
-                           const std::string& table_name);
-    
+                            const std::vector<SchemaColumn>& columns,
+                            const std::string& table_name);
     static std::vector<SchemaColumn> readSchema(const std::string& table_dir);
-    
     static bool schemaExists(const std::string& table_dir);
 
 private:

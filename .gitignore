@@ -1,0 +1,19 @@
+# Compiled object files
+*.obj
+*.exe
+*.pch
+*.ipch
+
+# VS specific
+.vs/
+*.db
+*.sqlite
+*.suo
+*.wsuo
+ProjectSettings.json
+VSWorkspaceState.json
+DocumentLayout.json
+Browse.VC.db
+
+# Test data (generated at runtime)
+data/

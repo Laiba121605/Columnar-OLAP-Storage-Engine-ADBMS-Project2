@@ -6,12 +6,11 @@
 #include <vector>
 #include <fstream>
 
+// No changes needed to CSVParser header
 class CSVParser {
 public:
     explicit CSVParser(const std::string& filename);
-    
     bool parse();
-    
     std::vector<std::string> getHeaders() const;
     std::vector<Row> getRows() const;
     size_t getRowCount() const;
@@ -23,7 +22,6 @@ private:
     std::vector<Row> rows_;
     std::string last_error_;
     std::ifstream file_;
-    
     std::vector<std::string> parseLine(const std::string& line);
 };
 
