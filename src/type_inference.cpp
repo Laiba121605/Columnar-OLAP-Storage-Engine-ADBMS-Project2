@@ -47,9 +47,8 @@ ColumnType TypeInference::inferType(const std::vector<std::string>& values) {
     long long max_val = LLONG_MIN;
 
     for (const auto& v : values) {
-        if (v.empty()) continue; // ignore missing values
+        if (v.empty()) continue;
 
-        // -------- INT CHECK --------
         if (isInt64(v)) {
             long long num = std::stoll(v);
             min_val = std::min(min_val, num);
@@ -58,20 +57,23 @@ ColumnType TypeInference::inferType(const std::vector<std::string>& values) {
             all_int = false;
         }
 
-        // -------- DOUBLE CHECK --------
         if (!isDouble(v)) {
             all_double = false;
         }
 
-        // Early exit: clearly not numeric
         if (!all_int && !all_double) {
             return ColumnType::STRING;
         }
     }
 
-    // --------------------------------------------------------
-    // CASE 1: INT COLUMN (decide INT32 vs INT64)
-    // --------------------------------------------------------
+    // ========== ADD THIS BLOCK HERE ==========
+    bool all_empty = true;
+    for (const auto& v : values) {
+        if (!v.empty()) { all_empty = false; break; }
+    }
+    if (all_empty) return ColumnType::STRING;
+    // =========================================
+
     if (all_int) {
         if (min_val >= INT32_MIN && max_val <= INT32_MAX) {
             return ColumnType::INT32;
@@ -79,16 +81,10 @@ ColumnType TypeInference::inferType(const std::vector<std::string>& values) {
         return ColumnType::INT64;
     }
 
-    // --------------------------------------------------------
-    // CASE 2: DOUBLE COLUMN
-    // --------------------------------------------------------
     if (all_double) {
         return ColumnType::DOUBLE;
     }
 
-    // --------------------------------------------------------
-    // DEFAULT
-    // --------------------------------------------------------
     return ColumnType::STRING;
 }
 
