@@ -3,7 +3,9 @@
 #include <cstring>
 
 // ============================================================
-// ColumnReader implementation — P2: Storage Read
+// ColumnReader implementation
+// Phase 1: NONE encoding
+// Phase 2: DICTIONARY and RLE decoders
 // ============================================================
 
 ColumnReader::ColumnReader()
@@ -14,6 +16,9 @@ ColumnReader::ColumnReader()
     , dict_size_(0)
     , rows_read_(0)
     , is_open_(false)
+    , id_width_(1)           // Phase 2: default, overwritten in loadDictionary()
+    , rle_remaining_(0)      // Phase 2: no run loaded yet
+    , rle_run_loaded_(false) // Phase 2: first call to readNextRLE will load first pair
 {}
 
 ColumnReader::~ColumnReader() {
@@ -23,12 +28,11 @@ ColumnReader::~ColumnReader() {
 // ============================================================
 // open()
 // Steps:
-//   1. Build the filepath from table_dir + column_name + ".col"
-//   2. Open the file in binary mode
-//   3. Verify CRC64 footer (catches corruption)
-//   4. Read and validate the 36-byte header
-//   5. Seek to start of data section (offset 36)
-//   6. TODO Phase 2: if DICTIONARY, load dictionary into memory
+//   1. Open file in binary mode
+//   2. Verify CRC64 footer
+//   3. Read and validate 36-byte header
+//   4. Seek to start of data section (offset 36)
+//   5. Phase 2: if DICTIONARY, load dictionary into memory
 // ============================================================
 bool ColumnReader::open(const std::string& table_dir,
                         const std::string& column_name) {
@@ -41,28 +45,34 @@ bool ColumnReader::open(const std::string& table_dir,
         return false;
     }
 
-    // Step 1: verify CRC before reading anything.
-    // Manual Section 4: footer_crc64 covers everything above it.
-    // If the file is corrupt we refuse to read it.
     if (!verifyCRC()) {
         file_.close();
         return false;
     }
 
-    // Step 2: read and validate header.
     if (!verifyAndLoadHeader()) {
         file_.close();
         return false;
     }
 
-    // Step 3: record where data starts so reset() can return here.
-    // Data always starts at byte 36 (right after the 36-byte header).
     data_start_ = HEADER_SIZE;
     file_.seekg(data_start_);
 
-    // TODO Phase 2: if encoding_ == DICTIONARY, call loadDictionary()
-    // here. The dictionary sits after the data section at offset
-    // (HEADER_SIZE + data_size_), and is dict_size_ bytes long.
+    // Phase 2: load dictionary into memory if this is a DICTIONARY column.
+    // The dictionary sits after the data section and is dict_size_ bytes long.
+    // We must do this before any calls to next() so the id->string map is ready.
+    if (encoding_ == Encoding::DICTIONARY) {
+        loadDictionary();
+        // Seek back to data section after loading dictionary
+        file_.seekg(data_start_);
+    }
+
+    // Phase 2: initialise RLE state so readNextRLE() knows it must
+    // load the first (value, run_length) pair on its first call.
+    if (encoding_ == Encoding::RLE) {
+        rle_remaining_  = 0;
+        rle_run_loaded_ = false;
+    }
 
     is_open_   = true;
     rows_read_ = 0;
@@ -71,12 +81,8 @@ bool ColumnReader::open(const std::string& table_dir,
 
 // ============================================================
 // verifyCRC()
-// Reads the entire file, computes CRC64 over everything except
-// the last 8 bytes, and compares with the stored footer.
-// Manual Section 4: "footer_crc64 — CRC64 over everything above"
 // ============================================================
 bool ColumnReader::verifyCRC() {
-    // Read entire file
     file_.seekg(0, std::ios::end);
     std::streamsize file_size = file_.tellg();
     file_.seekg(0, std::ios::beg);
@@ -93,11 +99,8 @@ bool ColumnReader::verifyCRC() {
         return false;
     }
 
-    // Last 8 bytes = stored CRC
     uint64_t stored_crc = 0;
     memcpy(&stored_crc, buf.data() + file_size - CRC64_SIZE, CRC64_SIZE);
-
-    // Compute CRC over everything before the footer
     uint64_t computed_crc = crc64(buf.data(), file_size - CRC64_SIZE);
 
     if (stored_crc != computed_crc) {
@@ -105,15 +108,12 @@ bool ColumnReader::verifyCRC() {
         return false;
     }
 
-    // Seek back to beginning for header read
     file_.seekg(0, std::ios::beg);
     return true;
 }
 
 // ============================================================
 // verifyAndLoadHeader()
-// Reads the 36-byte header and validates every field.
-// Populates type_, encoding_, row_count_, data_size_, dict_size_.
 // ============================================================
 bool ColumnReader::verifyAndLoadHeader() {
     ColumnHeader header;
@@ -123,26 +123,20 @@ bool ColumnReader::verifyAndLoadHeader() {
         return false;
     }
 
-    // Validate magic bytes
     if (header.magic != MAGIC) {
         last_error_ = "Invalid magic bytes in: " + filepath_;
         return false;
     }
-
-    // Validate version
     if (header.version != VERSION) {
         last_error_ = "Unsupported version " +
                       std::to_string(header.version) + " in: " + filepath_;
         return false;
     }
-
-    // Validate reserved field
     if (header.reserved != 0) {
         last_error_ = "Reserved field not zero in: " + filepath_;
         return false;
     }
 
-    // Load metadata
     type_      = static_cast<ColumnType>(header.type);
     encoding_  = static_cast<Encoding>(header.encoding);
     row_count_ = header.row_count;
@@ -154,7 +148,6 @@ bool ColumnReader::verifyAndLoadHeader() {
 
 // ============================================================
 // hasNext()
-// True if there are still rows left to read.
 // ============================================================
 bool ColumnReader::hasNext() const {
     return is_open_ && (rows_read_ < row_count_);
@@ -162,26 +155,14 @@ bool ColumnReader::hasNext() const {
 
 // ============================================================
 // next()
-// Returns the next decoded value and advances the cursor.
 // Dispatches to the right decoder based on encoding_.
 // ============================================================
 ColumnValue ColumnReader::next() {
     rows_read_++;
-
     switch (encoding_) {
-        case Encoding::NONE:
-            return readNextNone();
-
-        case Encoding::DICTIONARY:
-            // TODO Phase 2: return readNextDict();
-            last_error_ = "DICTIONARY encoding not yet implemented (Phase 2)";
-            return std::string("");
-
-        case Encoding::RLE:
-            // TODO Phase 2: return readNextRLE();
-            last_error_ = "RLE encoding not yet implemented (Phase 2)";
-            return int64_t(0);
-
+        case Encoding::NONE:       return readNextNone();
+        case Encoding::DICTIONARY: return readNextDict();
+        case Encoding::RLE:        return readNextRLE();
         default:
             last_error_ = "Unknown encoding";
             return int64_t(0);
@@ -189,44 +170,32 @@ ColumnValue ColumnReader::next() {
 }
 
 // ============================================================
-// readNextNone()
-// Raw decoding — read the value directly from the file.
-// Dispatches on column type (INT64, DOUBLE, STRING).
-// Manual Section 6.1: "No encoding: read the data section as-is,
-// one value at a time."
+// readNextNone() — Phase 1, unchanged
 // ============================================================
 ColumnValue ColumnReader::readNextNone() {
     switch (type_) {
-
         case ColumnType::INT64: {
             int64_t val = 0;
             file_.read(reinterpret_cast<char*>(&val), sizeof(int64_t));
             return val;
         }
-
         case ColumnType::INT32: {
-            // TODO Phase 2/3: INT32 used for date columns
             int32_t val = 0;
             file_.read(reinterpret_cast<char*>(&val), sizeof(int32_t));
-            return static_cast<int64_t>(val);  // promote to int64 for uniformity
+            return static_cast<int64_t>(val);
         }
-
         case ColumnType::DOUBLE: {
             double val = 0.0;
             file_.read(reinterpret_cast<char*>(&val), sizeof(double));
             return val;
         }
-
         case ColumnType::STRING: {
-            // Manual Section 4: STRING = 2-byte length prefix + bytes
-            // Must match exactly what P1's writeStringRaw() wrote.
             uint16_t len = 0;
             file_.read(reinterpret_cast<char*>(&len), sizeof(uint16_t));
             std::string val(len, '\0');
             file_.read(&val[0], len);
             return val;
         }
-
         default:
             last_error_ = "Unknown column type";
             return int64_t(0);
@@ -234,53 +203,147 @@ ColumnValue ColumnReader::readNextNone() {
 }
 
 // ============================================================
-// TODO Phase 2: readNextDict()
-// Load dictionary on open(), then for each row:
-//   - read a small integer id (1, 2, or 4 bytes depending on D)
-//   - return dictionary_[id]
-// Manual Section 6.1: "read the dictionary into memory (it is
-// small). Then read the data section as small integers; for each
-// integer, look up the corresponding string in the dictionary."
-// ============================================================
-ColumnValue ColumnReader::readNextDict() {
-    // Placeholder — implement in Phase 2
-    return std::string("");
-}
-
-// ============================================================
-// TODO Phase 2: readNextRLE()
-// Keep track of current (value, remaining_count) pair.
-// When remaining_count hits 0, read the next pair from file.
-// Manual Section 6.1: "read the data section as (value, length)
-// pairs. The iterator emits value length times before advancing."
-// ============================================================
-ColumnValue ColumnReader::readNextRLE() {
-    // Placeholder — implement in Phase 2
-    return int64_t(0);
-}
-
-// ============================================================
-// TODO Phase 2: loadDictionary()
-// Called once on open() when encoding == DICTIONARY.
-// Seeks to (HEADER_SIZE + data_size_), reads dict_size_ bytes,
-// parses the string entries and fills dictionary_ vector.
+// Phase 2: loadDictionary()
+// Called once in open() when encoding == DICTIONARY.
+// Seeks to (HEADER_SIZE + data_size_) — the byte right after
+// the data section — and reads dict_size_ bytes, parsing
+// each entry as: uint16_t length + raw bytes.
+// Fills dictionary_[] so readNextDict() can do O(1) lookups.
+//
+// Also determines id_width_ from the number of entries D:
+//   D <= 256   → id_width_ = 1
+//   D <= 65536 → id_width_ = 2
+//   else       → id_width_ = 4
+// This must match exactly what writeDictId() used when writing.
 // ============================================================
 void ColumnReader::loadDictionary() {
-    // Placeholder — implement in Phase 2
+    dictionary_.clear();
+
+    // Seek to the dictionary section: right after the data section.
+    std::streampos dict_start = HEADER_SIZE + static_cast<std::streampos>(data_size_);
+    file_.seekg(dict_start);
+
+    std::streampos dict_end = dict_start + static_cast<std::streampos>(dict_size_);
+
+    while (file_.tellg() < dict_end && !file_.fail()) {
+        uint16_t len = 0;
+        file_.read(reinterpret_cast<char*>(&len), sizeof(uint16_t));
+        if (file_.fail()) break;
+
+        std::string s(len, '\0');
+        file_.read(&s[0], len);
+        if (file_.fail()) break;
+
+        dictionary_.push_back(s);
+    }
+
+    // Derive id_width_ from D, matching what the writer used
+    uint32_t D = static_cast<uint32_t>(dictionary_.size());
+    if      (D <= 256)   id_width_ = 1;
+    else if (D <= 65536) id_width_ = 2;
+    else                  id_width_ = 4;
+}
+
+// ============================================================
+// Phase 2: readNextDict()
+// Reads one id from the data section (id_width_ bytes),
+// looks it up in dictionary_[], returns the string.
+// Manual Section 6.1: "read the data section as small integers;
+// for each integer, look up the corresponding string in the
+// dictionary."
+// ============================================================
+ColumnValue ColumnReader::readNextDict() {
+    uint32_t id = 0;
+
+    if (id_width_ == 1) {
+        uint8_t v = 0;
+        file_.read(reinterpret_cast<char*>(&v), 1);
+        id = v;
+    } else if (id_width_ == 2) {
+        uint16_t v = 0;
+        file_.read(reinterpret_cast<char*>(&v), 2);
+        id = v;
+    } else {
+        file_.read(reinterpret_cast<char*>(&id), 4);
+    }
+
+    if (file_.fail() || id >= dictionary_.size()) {
+        last_error_ = "Dictionary id out of range or read error";
+        return std::string("");
+    }
+
+    return dictionary_[id];
+}
+
+// ============================================================
+// Phase 2: readNextRLE()
+// Maintains (rle_current_value_, rle_remaining_) state across calls.
+// When rle_remaining_ hits 0, reads the next (value, run_length)
+// pair from the file.
+// Manual Section 6.1: "The iterator emits value length times
+// before advancing to the next pair."
+//
+// On-disk format per pair:
+//   INT64 column:  int64_t (8 bytes) + uint64_t run_length (8 bytes)
+//   DOUBLE column: double  (8 bytes) + uint64_t run_length (8 bytes)
+// ============================================================
+ColumnValue ColumnReader::readNextRLE() {
+    // Load next pair if no rows remain in the current run
+    if (rle_remaining_ == 0) {
+        // run_length is stored as uint64_t on disk.
+        // The writer (writeRLEColumn test helper and column_writer.cpp) both
+        // use uint64_t for run_length.  The original code used uint32_t which
+        // caused it to read only 4 of the 8 bytes, leaving the file pointer
+        // misaligned for every subsequent pair.
+        uint64_t run = 0;
+
+        if (type_ == ColumnType::INT64 || type_ == ColumnType::INT32) {
+            int64_t val = 0;
+            file_.read(reinterpret_cast<char*>(&val), sizeof(int64_t));
+            file_.read(reinterpret_cast<char*>(&run), sizeof(uint64_t));
+            if (file_.fail() || run == 0) {
+                last_error_ = "RLE read error or zero-length run";
+                return int64_t(0);
+            }
+            rle_current_value_ = val;
+        } else if (type_ == ColumnType::DOUBLE) {
+            double val = 0.0;
+            file_.read(reinterpret_cast<char*>(&val), sizeof(double));
+            file_.read(reinterpret_cast<char*>(&run), sizeof(uint64_t));
+            if (file_.fail() || run == 0) {
+                last_error_ = "RLE read error or zero-length run";
+                return double(0.0);
+            }
+            rle_current_value_ = val;
+        } else {
+            last_error_ = "RLE not supported for STRING columns";
+            return int64_t(0);
+        }
+
+        rle_remaining_  = run;
+        rle_run_loaded_ = true;
+    }
+
+    rle_remaining_--;
+    return rle_current_value_;
 }
 
 // ============================================================
 // reset()
-// Seeks back to the start of the data section.
-// The executor uses this when it needs to scan a column twice —
-// first to build a predicate bitmap, then to aggregate.
-// Manual Section 6.2: bitmap approach requires reading predicate
-// column first, then scanning aggregate columns.
+// Seeks back to data section start.
+// Phase 2: also resets RLE state so the decoder starts fresh.
+// DICTIONARY doesn't need reset — dictionary_[] stays in memory.
 // ============================================================
 void ColumnReader::reset() {
     if (!is_open_) return;
     file_.seekg(data_start_);
     rows_read_ = 0;
+
+    // Phase 2: reset RLE state so next call reads a fresh pair
+    if (encoding_ == Encoding::RLE) {
+        rle_remaining_  = 0;
+        rle_run_loaded_ = false;
+    }
 }
 
 // ============================================================
@@ -290,4 +353,7 @@ void ColumnReader::close() {
     if (file_.is_open()) file_.close();
     is_open_   = false;
     rows_read_ = 0;
+    dictionary_.clear();
+    rle_remaining_  = 0;
+    rle_run_loaded_ = false;
 }

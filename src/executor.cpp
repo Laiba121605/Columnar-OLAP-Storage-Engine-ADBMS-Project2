@@ -127,6 +127,14 @@ size_t Executor::calculateBytesRead(const std::vector<std::string>& colNames,
 
 // ============================================================
 // Main entry point
+//
+// FIX (Issue 2): The sub-functions (executePlainSelect,
+// executeGroupBy, executeSelectStar) used to print their own
+// "(N rows)" or "(N groups)" line and then run() would print
+// "(X ms)" on a separate line. The spec shows one combined line:
+// "(24 rows, 38 ms)". Fix: sub-functions now return the row/group
+// count as a size_t instead of printing it themselves. run()
+// assembles the final combined line with both count and timing.
 // ============================================================
 bool Executor::run(const QueryPlan& plan,
                    const Bitmap& bitmap,
@@ -137,28 +145,40 @@ bool Executor::run(const QueryPlan& plan,
 
     auto start = std::chrono::high_resolution_clock::now();
     bool success = false;
-    
+
     // Count total rows
     uint64_t rowCount = getRowCount(readers);
 
+    // FIX (Issue 2): sub-functions now return count via out-param
+    // instead of printing it themselves; run() prints the combined line.
+    size_t resultCount = 0;
+    std::string countLabel = "rows";
+
     // ── Route to the correct execution path ──
     if (plan.select_star) {
-        success = executeSelectStar(plan, bitmap, readers, colNames, schema);
+        success = executeSelectStar(plan, bitmap, readers, colNames, schema, resultCount);
     } else if (!plan.groupby.empty()) {
-        success = executeGroupBy(plan, bitmap, readers, colNames, schema);
+        countLabel = "groups";
+        success = executeGroupBy(plan, bitmap, readers, colNames, schema, resultCount);
     } else if (hasAggregates(plan)) {
+        // Aggregates always produce 1 result row
         success = executeAggregate(plan, bitmap, readers, colNames);
+        resultCount = 1;
     } else {
-        success = executePlainSelect(plan, bitmap, readers, colNames);
+        success = executePlainSelect(plan, bitmap, readers, colNames, resultCount);
     }
 
-    // Stop timing and print stats
+    // Stop timing
     auto end = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
     if (success) {
-        std::cout << "(" << ms << " ms)\n";
-        // Calculate and print stats
+        // FIX (Issue 2): print count and timing on one combined line,
+        // matching spec format: "(24 rows, 38 ms)" or "(24 groups, 38 ms)"
+        std::cout << "(" << resultCount << " " << countLabel
+                  << ", " << ms << " ms)\n";
+
+        // Print column I/O stats
         size_t bytesRead = calculateBytesRead(colNames, schema, rowCount);
         double mb = bytesRead / (1024.0 * 1024.0);
         size_t totalCols = schema.size();
@@ -176,12 +196,18 @@ bool Executor::run(const QueryPlan& plan,
 // Manual Section 6.3: "For SELECT *, the executor reads every
 // column, applies the filter, and prints the matching rows."
 // This is the point-lookup path that column stores are bad at.
+//
+// FIX (Issue 1): The function previously incremented `printed`
+// but never printed it — the closing block was a no-op comment.
+// run() now expects the count back via the `resultCount` out-param
+// (part of Issue 2 fix), which also resolves Issue 1.
 // ============================================================
 bool Executor::executeSelectStar(const QueryPlan& plan,
                                  const Bitmap& bitmap,
                                  std::vector<ColumnReader*>& readers,
                                  const std::vector<std::string>& colNames,
-                                 const std::vector<SchemaColumn>& schema) {
+                                 const std::vector<SchemaColumn>& schema,
+                                 size_t& resultCount) {  // FIX (Issue 1 & 2): added out-param
 
     // Reset all readers to start
     for (auto* r : readers) r->reset();
@@ -208,7 +234,7 @@ bool Executor::executeSelectStar(const QueryPlan& plan,
     }
 
     uint64_t rowCount = getRowCount(readers);
-    size_t printed = 0;
+    resultCount = 0;  // FIX (Issue 1): initialise out-param
 
     for (uint64_t row = 0; row < rowCount; row++) {
         // Check bitmap
@@ -232,12 +258,11 @@ bool Executor::executeSelectStar(const QueryPlan& plan,
             if (c + 1 < schema.size()) std::cout << " | ";
         }
         std::cout << "\n";
-        printed++;
+        resultCount++;  // FIX (Issue 1): count printed rows into out-param
     }
 
-    if (printed == 1 && !plan.where.has_where) {
-        // Single row, no WHERE — already printed above
-    }
+    // FIX (Issue 1): removed the dead no-op `if (printed == 1 ...)` block.
+    // Row count is now returned via resultCount and printed by run().
 
     return true;
 }
@@ -245,11 +270,16 @@ bool Executor::executeSelectStar(const QueryPlan& plan,
 // ============================================================
 // CASE 2: Plain SELECT col1, col2 (no aggregates, no GROUP BY)
 // Example: SELECT country, price FROM sales WHERE id = 500000
+//
+// FIX (Issue 2): removed `std::cout << "(" << printed << " rows)\n";`
+// from inside this function. Count is returned via resultCount
+// out-param; run() prints the combined "(N rows, X ms)" line.
 // ============================================================
 bool Executor::executePlainSelect(const QueryPlan& plan,
                                   const Bitmap& bitmap,
                                   std::vector<ColumnReader*>& readers,
-                                  const std::vector<std::string>& colNames) {
+                                  const std::vector<std::string>& colNames,
+                                  size_t& resultCount) {  // FIX (Issue 2): added out-param
 
     // Reset all readers
     for (auto* r : readers) r->reset();
@@ -274,7 +304,7 @@ bool Executor::executePlainSelect(const QueryPlan& plan,
     std::cout << "\n";
 
     uint64_t rowCount = getRowCount(readers);
-    size_t printed = 0;
+    resultCount = 0;  // FIX (Issue 2): initialise out-param
 
     for (uint64_t row = 0; row < rowCount; row++) {
         // Check bitmap
@@ -298,7 +328,6 @@ bool Executor::executePlainSelect(const QueryPlan& plan,
         for (size_t s = 0; s < plan.selects.size(); s++) {
             int rIdx = selectToReader[s];
             if (rIdx >= 0) {
-                // We don't know the exact type here, print generically
                 const auto& cv = rowValues[rIdx];
                 if (std::holds_alternative<int64_t>(cv))
                     std::cout << std::get<int64_t>(cv);
@@ -310,16 +339,24 @@ bool Executor::executePlainSelect(const QueryPlan& plan,
             if (s + 1 < plan.selects.size()) std::cout << " | ";
         }
         std::cout << "\n";
-        printed++;
+        resultCount++;  // FIX (Issue 2): accumulate into out-param
     }
 
-    std::cout << "(" << printed << " rows)\n";
+    // FIX (Issue 2): removed `std::cout << "(" << printed << " rows)\n";`
+    // run() now prints the combined "(N rows, X ms)" line instead.
+
     return true;
 }
 
 // ============================================================
 // CASE 3: Aggregates WITHOUT GROUP BY
 // Example: SELECT SUM(price), COUNT(*) FROM sales WHERE date >= 20240101
+//
+// FIX (Issue 3): COUNT(*) and COUNT(col) were printed as doubles
+// (e.g. "82134.000000") because AggState::result() returns double
+// and the old code did `std::cout << states[s].result()` with no
+// format override. Fix: detect COUNT and cast to int64_t before
+// printing, so output is "82134" as the spec shows.
 // ============================================================
 bool Executor::executeAggregate(const QueryPlan& plan,
                                 const Bitmap& bitmap,
@@ -381,7 +418,7 @@ bool Executor::executeAggregate(const QueryPlan& plan,
         if (sel.agg == AggFunc::NONE) {
             std::cout << sel.col;
         } else {
-            std::cout << aggFuncName(sel.agg) << "(" 
+            std::cout << aggFuncName(sel.agg) << "("
                       << (sel.star ? "*" : sel.col) << ")";
         }
         if (s + 1 < plan.selects.size()) std::cout << " | ";
@@ -401,7 +438,18 @@ bool Executor::executeAggregate(const QueryPlan& plan,
 
     // Print one result row
     for (size_t s = 0; s < plan.selects.size(); s++) {
-        std::cout << states[s].result();
+        const auto& sel = plan.selects[s];
+
+        // FIX (Issue 3): COUNT results must print as integers, not floats.
+        // Before this fix, states[s].result() returned double and all
+        // aggregates were printed the same way, giving "82134.000000"
+        // for COUNT. Now COUNT is cast to int64_t before printing.
+        if (sel.agg == AggFunc::COUNT) {
+            std::cout << static_cast<int64_t>(states[s].result());
+        } else {
+            std::cout << std::fixed << std::setprecision(2) << states[s].result();
+        }
+
         if (s + 1 < plan.selects.size()) std::cout << " | ";
     }
     std::cout << "\n";
@@ -412,12 +460,20 @@ bool Executor::executeAggregate(const QueryPlan& plan,
 // ============================================================
 // CASE 4: GROUP BY with aggregates
 // Example: SELECT country, SUM(price) FROM sales GROUP BY country
+//
+// FIX (Issue 2): removed `std::cout << "(" << groupOrder.size() << " groups)\n";`
+// from inside this function. Count is returned via resultCount
+// out-param; run() prints the combined "(N groups, X ms)" line.
+//
+// FIX (Issue 3): COUNT in GROUP BY output now prints as int64_t
+// for the same reason as executeAggregate above.
 // ============================================================
 bool Executor::executeGroupBy(const QueryPlan& plan,
                               const Bitmap& bitmap,
                               std::vector<ColumnReader*>& readers,
                               const std::vector<std::string>& colNames,
-                              const std::vector<SchemaColumn>& schema) {
+                              const std::vector<SchemaColumn>& schema,
+                              size_t& resultCount) {  // FIX (Issue 2): added out-param
 
     // Reset all readers
     for (auto* r : readers) r->reset();
@@ -515,7 +571,7 @@ bool Executor::executeGroupBy(const QueryPlan& plan,
         if (sel.agg == AggFunc::NONE) {
             std::cout << sel.col;
         } else {
-            std::cout << aggFuncName(sel.agg) << "(" 
+            std::cout << aggFuncName(sel.agg) << "("
                       << (sel.star ? "*" : sel.col) << ")";
         }
         if (s + 1 < plan.selects.size()) std::cout << " | ";
@@ -542,8 +598,13 @@ bool Executor::executeGroupBy(const QueryPlan& plan,
                 // GROUP BY column — print the key
                 std::cout << key;
             } else {
-                // Print aggregate result
-                std::cout << groups[key][aggIdx].result();
+                // FIX (Issue 3): same COUNT integer fix as executeAggregate
+                if (sel.agg == AggFunc::COUNT) {
+                    std::cout << static_cast<int64_t>(groups[key][aggIdx].result());
+                } else {
+                    std::cout << std::fixed << std::setprecision(2)
+                              << groups[key][aggIdx].result();
+                }
                 aggIdx++;
             }
             if (s + 1 < plan.selects.size()) std::cout << " | ";
@@ -551,6 +612,9 @@ bool Executor::executeGroupBy(const QueryPlan& plan,
         std::cout << "\n";
     }
 
-    std::cout << "(" << groupOrder.size() << " groups)\n";
+    // FIX (Issue 2): removed `std::cout << "(" << groupOrder.size() << " groups)\n";`
+    // Return count via out-param; run() prints the combined line.
+    resultCount = groupOrder.size();
+
     return true;
 }
