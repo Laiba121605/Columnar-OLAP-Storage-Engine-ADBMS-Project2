@@ -1,87 +1,119 @@
 #include "../include/type_inference.h"
 #include <cstdlib>
 #include <cerrno>
+#include <climits>
 #include <cctype>
 
+// ------------------------------------------------------------
+// Check INT64
+// ------------------------------------------------------------
 bool TypeInference::isInt64(const std::string& str) {
     if (str.empty()) return false;
 
     char* endptr;
     errno = 0;
     long long val = std::strtoll(str.c_str(), &endptr, 10);
-
     (void)val;
 
     return (errno == 0 && *endptr == '\0');
 }
 
+// ------------------------------------------------------------
+// Check DOUBLE
+// ------------------------------------------------------------
 bool TypeInference::isDouble(const std::string& str) {
     if (str.empty()) return false;
 
     char* endptr;
     errno = 0;
     double val = std::strtod(str.c_str(), &endptr);
-
     (void)val;
 
     return (errno == 0 && *endptr == '\0');
 }
 
+// ------------------------------------------------------------
+// CORE TYPE INFERENCE
+// Priority:
+//   INT32  < INT64 < DOUBLE < STRING
+// ------------------------------------------------------------
 ColumnType TypeInference::inferType(const std::vector<std::string>& values) {
-    if (values.empty()) {
-        return ColumnType::STRING;
-    }
+    if (values.empty()) return ColumnType::STRING;
 
-    bool all_int    = true;
+    bool all_int = true;
     bool all_double = true;
 
+    long long min_val = LLONG_MAX;
+    long long max_val = LLONG_MIN;
+
     for (const auto& v : values) {
-        // FIXED (Warning 2 fix): skip empty cells when inferring type
-        // Before this fix: empty string made isInt64() and isDouble()
-        // both return false, so a column like:
-        //   price: 99.99, 149.50, [empty], 79.95
-        // would be inferred as STRING even though it's clearly DOUBLE.
-        // The loader then tried to write it as a string but substituted
-        // 0.0 for the empty cell — the inferred type and written type
-        // contradicted each other.
-        // Fix: skip empty strings. An empty cell doesn't tell us anything
-        // about the column's type. The loader already handles empty cells
-        // by writing 0 or 0.0 as a default value.
-        if (v.empty()) continue;
+        if (v.empty()) continue; // ignore missing values
 
-        if (!isInt64(v))  all_int    = false;
-        if (!isDouble(v)) all_double = false;
+        // -------- INT CHECK --------
+        if (isInt64(v)) {
+            long long num = std::stoll(v);
+            min_val = std::min(min_val, num);
+            max_val = std::max(max_val, num);
+        } else {
+            all_int = false;
+        }
 
+        // -------- DOUBLE CHECK --------
+        if (!isDouble(v)) {
+            all_double = false;
+        }
+
+        // Early exit: clearly not numeric
         if (!all_int && !all_double) {
             return ColumnType::STRING;
         }
     }
 
-    // Edge case: if EVERY cell was empty, default to STRING
-    if (all_int)    return ColumnType::INT64;
-    if (all_double) return ColumnType::DOUBLE;
+    // --------------------------------------------------------
+    // CASE 1: INT COLUMN (decide INT32 vs INT64)
+    // --------------------------------------------------------
+    if (all_int) {
+        if (min_val >= INT32_MIN && max_val <= INT32_MAX) {
+            return ColumnType::INT32;
+        }
+        return ColumnType::INT64;
+    }
+
+    // --------------------------------------------------------
+    // CASE 2: DOUBLE COLUMN
+    // --------------------------------------------------------
+    if (all_double) {
+        return ColumnType::DOUBLE;
+    }
+
+    // --------------------------------------------------------
+    // DEFAULT
+    // --------------------------------------------------------
     return ColumnType::STRING;
 }
 
+// ------------------------------------------------------------
+// Infer all columns
+// ------------------------------------------------------------
 std::vector<ColumnType> TypeInference::inferAllTypes(
     const std::vector<Row>& rows,
     size_t num_columns)
 {
     std::vector<ColumnType> types(num_columns, ColumnType::STRING);
 
-    if (rows.empty()) {
-        return types;
-    }
+    if (rows.empty()) return types;
 
     for (size_t col = 0; col < num_columns; col++) {
         std::vector<std::string> column_values;
+
         for (const auto& row : rows) {
             if (col < row.size()) {
                 column_values.push_back(row[col]);
             } else {
-                column_values.push_back("");
+                column_values.push_back(""); // missing cell
             }
         }
+
         types[col] = inferType(column_values);
     }
 
