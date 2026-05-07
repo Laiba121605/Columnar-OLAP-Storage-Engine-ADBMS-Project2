@@ -5,13 +5,13 @@
 #include <string>
 #include <vector>
 
-// No changes needed to TypeInference header
 class TypeInference {
 public:
     static ColumnType inferType(const std::vector<std::string>& column_values);
     static std::vector<ColumnType> inferAllTypes(const std::vector<Row>& rows, size_t num_columns);
+
     static bool isInt64(const std::string& str);
     static bool isDouble(const std::string& str);
 };
 
-#endif // TYPE_INFERENCE_H
+#endif
