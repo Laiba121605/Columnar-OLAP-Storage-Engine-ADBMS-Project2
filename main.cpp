@@ -1,4 +1,8 @@
 #include <iostream>
+#include <fstream>    // FIX (Issue 5): added missing include. processInfo() uses
+                      // std::ifstream to read .col file sizes for the INFO command.
+                      // Without this, compilation fails on stricter compilers that
+                      // don't pull <fstream> in transitively via other headers.
 #include <string>
 #include <vector>
 #include <sstream>
@@ -83,7 +87,7 @@ static void processInfo(const std::string& tableName, const std::string& warehou
     std::cout << "Columns: " << schema.size() << "\n\n";
 
     // Print header
-    std::cout << std::left 
+    std::cout << std::left
               << std::setw(20) << "COLUMN"
               << std::setw(12) << "TYPE"
               << std::setw(14) << "ENCODING"
@@ -94,8 +98,8 @@ static void processInfo(const std::string& tableName, const std::string& warehou
 
     for (const auto& col : schema) {
         std::string filepath = tableDir + "/" + col.name + ".col";
-        
-        // Get file size
+
+        // std::ifstream is now safe to use here because <fstream> is included above.
         std::ifstream file(filepath, std::ios::binary | std::ios::ate);
         size_t sizeBytes = 0;
         if (file.is_open()) {
@@ -126,14 +130,11 @@ static void processQuery(const std::string& queryText, const std::string& wareho
     // ── Step 1: Parse the query ─────────────────────────
     QueryParser parser(queryText);
     QueryPlan plan;
-    
+
     if (!parser.parse(plan)) {
         std::cerr << "Parse error: " << parser.getError() << "\n";
         return;
     }
-
-    // Debug: print the parsed plan
-    // printQueryPlan(plan);  // uncomment for debugging
 
     std::string tableDir = warehousePath + "/" + plan.table;
 
@@ -153,7 +154,7 @@ static void processQuery(const std::string& queryText, const std::string& wareho
 
     // ── Step 3: Determine which columns to open ─────────
     std::vector<std::string> colsToOpen;
-    
+
     if (plan.select_star) {
         // SELECT * — need ALL columns
         for (const auto& sc : schema) {
@@ -185,7 +186,7 @@ static void processQuery(const std::string& queryText, const std::string& wareho
     readerStorage.resize(colsToOpen.size());
     for (size_t i = 0; i < colsToOpen.size(); i++) {
         if (!readerStorage[i].open(tableDir, colsToOpen[i])) {
-            std::cerr << "Error opening column '" << colsToOpen[i] 
+            std::cerr << "Error opening column '" << colsToOpen[i]
                       << "': " << readerStorage[i].getLastError() << "\n";
             // Close already-opened readers
             for (size_t j = 0; j < i; j++) {
@@ -222,9 +223,6 @@ static void processQuery(const std::string& queryText, const std::string& wareho
         } else {
             // WHERE column wasn't opened yet — open it temporarily
             bitmap = PredicateEvaluator::evaluate(plan.where, tableDir, rowCount);
-
-            // Also add it to readers if needed
-            // (evaluator opens and closes internally)
         }
 
         if (bitmap.empty() && plan.where.has_where) {
@@ -256,11 +254,11 @@ static void processQuery(const std::string& queryText, const std::string& wareho
 static void processLoad(const std::string& args, const std::string& warehousePath) {
     // Expected format: <csv_file> AS <table_name>
     std::string trimmed = trim(args);
-    
+
     // Find "AS" keyword (case-insensitive)
     std::string upper = trimmed;
     for (char& c : upper) c = std::toupper(c);
-    
+
     size_t asPos = upper.find(" AS ");
     if (asPos == std::string::npos) {
         std::cerr << "Usage: LOAD <csv_file> AS <table_name>\n";
