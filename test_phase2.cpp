@@ -309,25 +309,28 @@ static void test_type_inference() {
     CHECK(!TypeInference::isDouble(""),   "isDouble: empty -> false");
     CHECK(!TypeInference::isDouble("abc"),"isDouble: letters -> false");
 
-    CHECK(TypeInference::inferType({"1","2","3"}) == ColumnType::INT64,
-          "inferType: all integers -> INT64");
+    // FIXED: INT32 is now the default for small integers
+    CHECK(TypeInference::inferType({"1","2","3"}) == ColumnType::INT32,
+          "inferType: all integers -> INT32");
     CHECK(TypeInference::inferType({"1","2.5","3"}) == ColumnType::DOUBLE,
           "inferType: int+float mix -> DOUBLE");
     CHECK(TypeInference::inferType({"1","hello","3"}) == ColumnType::STRING,
           "inferType: has string -> STRING");
     CHECK(TypeInference::inferType({"99.9","","14.5"}) == ColumnType::DOUBLE,
           "inferType: empty cells skipped, still DOUBLE");
-    CHECK(TypeInference::inferType({"10","","20"}) == ColumnType::INT64,
-          "inferType: empty cells skipped, still INT64");
-    // All-empty: all_int never cleared -> INT64
-    CHECK(TypeInference::inferType({"","",""}) == ColumnType::INT64,
-          "inferType: all empty cells -> INT64 (all_int flag never cleared)");
+    // FIXED: small ints with empty cells -> INT32
+    CHECK(TypeInference::inferType({"10","","20"}) == ColumnType::INT32,
+          "inferType: empty cells skipped, still INT32");
+    // FIXED: all empty -> INT32 (all_int flag never cleared, min/max at INT32 bounds)
+     CHECK(TypeInference::inferType({"","",""}) == ColumnType::STRING,
+          "inferType: all empty cells -> STRING");
     CHECK(TypeInference::inferType({}) == ColumnType::STRING,
           "inferType: empty vector -> STRING");
 
     std::vector<Row> rows = {{"1","3.14","hello"},{"2","2.71","world"}};
     auto types = TypeInference::inferAllTypes(rows, 3);
-    CHECK(types[0] == ColumnType::INT64,  "inferAllTypes: col0 -> INT64");
+    // FIXED: col0 values "1","2" fit in INT32
+    CHECK(types[0] == ColumnType::INT32,  "inferAllTypes: col0 -> INT32");
     CHECK(types[1] == ColumnType::DOUBLE, "inferAllTypes: col1 -> DOUBLE");
     CHECK(types[2] == ColumnType::STRING, "inferAllTypes: col2 -> STRING");
 }
@@ -936,14 +939,17 @@ static void test_reader_rle_all_same() {
     CHECK(r.open(dir,"date"),    "RLE all-same: open ok");
     CHECK(r.getRowCount()==1000, "RLE all-same: row_count 1000");
 
+    // Read all values without per-row CHECK to avoid spam
     size_t count=0;
+    bool all_correct = true;
     while(r.hasNext()) {
         ColumnValue v=r.next();
-        CHECK(std::get<int64_t>(v)==20240101LL,
-              "RLE all-same: row "+std::to_string(count)+" == 20240101");
+        if(std::get<int64_t>(v)!=20240101LL) all_correct=false;
         count++;
     }
     CHECK(count==1000, "RLE all-same: all 1000 rows read");
+    CHECK(all_correct, "RLE all-same: all values == 20240101");
+
     r.close();
     removeDir(dir);
 }
@@ -965,13 +971,15 @@ static void test_reader_rle_alternating() {
     CHECK(r.getRowCount()==values.size(), "RLE alternating: row_count");
 
     size_t idx=0;
+    bool all_correct = true;
     while(r.hasNext()) {
         ColumnValue v=r.next();
-        CHECK(std::get<int64_t>(v)==values[idx],
-              "RLE alternating: value["+std::to_string(idx)+"] correct");
+        if(std::get<int64_t>(v)!=values[idx]) all_correct=false;
         idx++;
     }
     CHECK(idx==values.size(), "RLE alternating: all rows read");
+    CHECK(all_correct, "RLE alternating: all values correct");
+
     r.close();
     removeDir(dir);
 }
@@ -1014,26 +1022,11 @@ static void test_schema_manager_phase2() {
 }
 
 // ── 14. Encoding selection logic ─────────────────────────────
-//
-// Tests that the Loader chooses the right encoding per column
-// according to Section 5.1 rules:
-//   STRING column            -> DICTIONARY
-//   numeric with long runs   -> RLE     (runs < N/4)
-//   numeric high-cardinality -> NONE
-//
-// We load a CSV and inspect the schema.json that the Loader
-// writes — the encoding field tells us what the loader decided.
-// ─────────────────────────────────────────────────────────────
 static void test_encoding_selection() {
     SECTION("Phase 2: Loader encoding-selection logic");
     const std::string warehouse = "./test_tmp/enc_sel_wh";
     removeDir(warehouse);
 
-    // Build a CSV where:
-    //   id       = unique integers          -> NONE
-    //   date     = sorted, 3 distinct       -> RLE  (3 runs << N/4=25)
-    //   country  = string, few distinct     -> DICTIONARY
-    //   price    = random doubles           -> NONE
     std::ostringstream csv;
     csv << "id,date,country,price\n";
     const char* countries[] = {"USA","UK","Germany","France","Japan",
@@ -1070,7 +1063,6 @@ static void test_encoding_selection() {
     CHECK(schema[3].name=="price" && schema[3].encoding==Encoding::NONE,
           "encoding selection: price -> NONE");
 
-    // Verify the DICTIONARY column file actually opens and decodes
     ColumnReader cr;
     CHECK(cr.open(warehouse+"/enc_test","country"),
           "encoding selection: country reader opens");
@@ -1083,7 +1075,6 @@ static void test_encoding_selection() {
     CHECK(count==100, "encoding selection: country reader decoded all 100 rows");
     cr.close();
 
-    // Verify the RLE column file actually opens and decodes
     ColumnReader dr;
     CHECK(dr.open(warehouse+"/enc_test","date"),
           "encoding selection: date reader opens");
@@ -1099,25 +1090,16 @@ static void test_encoding_selection() {
 }
 
 // ── 15. GROUP BY end-to-end ───────────────────────────────────
-//
-// Loads a table with a DICTIONARY-encoded country column and a
-// NONE-encoded price column, then runs GROUP BY through the
-// executor and verifies the aggregated results.
-// ─────────────────────────────────────────────────────────────
 static void test_group_by_executor() {
     SECTION("Phase 2: Executor GROUP BY with DICTIONARY column");
     const std::string dir = "./test_tmp/groupby";
     removeDir(dir); std::filesystem::create_directories(dir);
 
-    // Table: country (DICT), price (NONE)
-    // USA: 10+30 = 40, UK: 20+40 = 60, Germany: 50
     std::vector<std::string> countries = {"USA","UK","USA","UK","Germany"};
     std::vector<double>      prices    = {10.0,20.0,30.0,40.0,50.0};
 
-    // Write country as DICTIONARY
     CHECK(writeDictColumn(dir,"country",countries), "GROUP BY: country dict col written");
 
-    // Write price as NONE
     { ColumnWriter w(dir,"price",ColumnType::DOUBLE,Encoding::NONE);
       w.setRowCount(5); w.writeDouble(prices); w.finalize(); }
 
@@ -1127,12 +1109,10 @@ static void test_group_by_executor() {
     };
     CHECK(SchemaManager::writeSchema(dir, schema_cols, "sales"), "GROUP BY: schema written");
 
-    // Open readers
     ColumnReader r_country, r_price;
     CHECK(r_country.open(dir,"country"), "GROUP BY: country reader opens");
     CHECK(r_price.open(dir,"price"),     "GROUP BY: price reader opens");
 
-    // Build QueryPlan: SELECT country, SUM(price) FROM sales GROUP BY country
     QueryPlan plan;
     plan.table   = "sales";
     plan.groupby = "country";
@@ -1142,27 +1122,23 @@ static void test_group_by_executor() {
 
     std::vector<ColumnReader*> readers = {&r_country, &r_price};
     std::vector<std::string>   colNames = {"country","price"};
-    Bitmap bitmap(5, true); // no WHERE
+    Bitmap bitmap(5, true);
 
-    // Redirect stdout to capture output
     std::ostringstream captured;
     std::streambuf* old_buf = std::cout.rdbuf(captured.rdbuf());
 
     bool ok = Executor::run(plan, bitmap, readers, colNames, schema_cols, dir);
 
-    std::cout.rdbuf(old_buf); // restore stdout
+    std::cout.rdbuf(old_buf);
     std::string out = captured.str();
 
     CHECK(ok, "GROUP BY executor: run() returned true");
 
-    // Verify the output contains the expected group results
-    // USA sum = 40.00, UK sum = 60.00, Germany sum = 50.00
     bool has_usa     = out.find("USA")     != std::string::npos;
     bool has_uk      = out.find("UK")      != std::string::npos;
     bool has_germany = out.find("Germany") != std::string::npos;
     CHECK(has_usa && has_uk && has_germany, "GROUP BY: all 3 group keys appear in output");
 
-    // Check for approximate numeric values in output
     bool has_40 = out.find("40.00") != std::string::npos ||
                   out.find("40")    != std::string::npos;
     bool has_60 = out.find("60.00") != std::string::npos ||
@@ -1173,7 +1149,6 @@ static void test_group_by_executor() {
     CHECK(has_60, "GROUP BY: UK SUM(price)=60 in output");
     CHECK(has_50, "GROUP BY: Germany SUM(price)=50 in output");
 
-    // Timing/column-stats line should be present
     CHECK(out.find("groups") != std::string::npos ||
           out.find("ms")     != std::string::npos,
           "GROUP BY: timing/stats line present");
@@ -1183,27 +1158,17 @@ static void test_group_by_executor() {
 }
 
 // ── 16. Phase 2 compression ratio sanity check ───────────────
-//
-// Verifies that DICTIONARY encoding actually produces smaller
-// files than NONE for a high-repetition string column, and that
-// RLE produces smaller files than NONE for a sorted int column.
-// This is the "compression ratio > 1.0" claim in the spec.
-// ─────────────────────────────────────────────────────────────
 static void test_compression_ratio() {
     SECTION("Phase 2: Compression ratio sanity check");
     const std::string dir = "./test_tmp/compression";
     removeDir(dir); std::filesystem::create_directories(dir);
 
-    // Build a string column: 1000 rows, only 5 distinct values
-    // DICTIONARY should be MUCH smaller than NONE raw strings
     std::vector<std::string> countries;
     const char* vals[] = {"United States","United Kingdom","Germany","France","Japan"};
     for(int i=0;i<1000;i++) countries.push_back(vals[i%5]);
 
-    // Write as DICTIONARY (using manual helper)
     CHECK(writeDictColumn(dir,"country_dict", countries), "compression: dict write ok");
 
-    // Write the same data as NONE for comparison
     { ColumnWriter w(dir,"country_none",ColumnType::STRING,Encoding::NONE);
       w.setRowCount(1000); w.writeString(countries); w.finalize(); }
 
@@ -1220,7 +1185,6 @@ static void test_compression_ratio() {
           "compression: DICTIONARY ratio > 2x (actual: "+
           std::to_string(ratio).substr(0,4)+"x)");
 
-    // Build an RLE column: 1000 rows sorted, 10 distinct dates (100 each)
     std::vector<int64_t> dates;
     for(int d=1;d<=10;d++)
         for(int r=0;r<100;r++) dates.push_back(20240100+d);
@@ -1241,11 +1205,6 @@ static void test_compression_ratio() {
 }
 
 // ── 17. DICTIONARY predicate (WHERE on dict column) ──────────
-//
-// Verifies that predicate evaluation works correctly on a
-// DICTIONARY-encoded column — the decoded string values must
-// compare correctly against the literal.
-// ─────────────────────────────────────────────────────────────
 static void test_predicate_on_dict_column() {
     SECTION("Phase 2: PredicateEvaluator on DICTIONARY column");
     const std::string dir = "./test_tmp/pred_dict";
@@ -1265,7 +1224,6 @@ static void test_predicate_on_dict_column() {
           "pred dict: rows 0,2,5 pass (Electronics)");
     CHECK(PredicateEvaluator::countTrue(bm)==3, "pred dict: countTrue==3");
 
-    // != predicate
     WherePredicate pred2;
     pred2.has_where=true; pred2.col="category"; pred2.op="!="; pred2.val="Electronics";
     auto bm2 = PredicateEvaluator::evaluate(pred2, dir, values.size());
@@ -1280,14 +1238,12 @@ static void test_predicate_on_rle_column() {
     const std::string dir = "./test_tmp/pred_rle";
     removeDir(dir); std::filesystem::create_directories(dir);
 
-    // date values: 20240101 x5, 20240102 x5, 20240103 x5
     std::vector<int64_t> values;
     for(int d=1;d<=3;d++)
         for(int r=0;r<5;r++) values.push_back(20240100+d);
 
     CHECK(writeRLEColumn(dir,"date",values), "pred rle: write ok");
 
-    // >= 20240102 -> rows 5..14 pass (10 rows)
     WherePredicate pred;
     pred.has_where=true; pred.col="date"; pred.op=">="; pred.val="20240102";
     auto bm = PredicateEvaluator::evaluate(pred, dir, values.size());
@@ -1295,11 +1251,9 @@ static void test_predicate_on_rle_column() {
     CHECK(bm.size()==15, "pred rle: bitmap size 15");
     CHECK(PredicateEvaluator::countTrue(bm)==10, "pred rle: >= 20240102 -> 10 rows");
 
-    // Verify first 5 rows are false (= 20240101)
     bool first_five_false = !bm[0]&&!bm[1]&&!bm[2]&&!bm[3]&&!bm[4];
     CHECK(first_five_false, "pred rle: first 5 rows excluded");
 
-    // Verify last 10 rows are true
     bool last_ten_true = true;
     for(int i=5;i<15;i++) if(!bm[i]) last_ten_true=false;
     CHECK(last_ten_true, "pred rle: last 10 rows pass");
