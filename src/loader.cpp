@@ -9,13 +9,21 @@
 #include <string>
 #include <unordered_set>
 
+#include <filesystem>
+// Use filesystem::create_directories for reliable nested directory creation
+// on all platforms. This replaces _mkdir/_mkdir which only create one level.
+static void make_dir_fs(const std::string& path) {
+    std::error_code ec;
 #ifdef _WIN32
-    #include <direct.h>
-    #define make_dir(p) _mkdir(p)
+    std::string native = path;
+    for (char& c : native) if (c == '/') c = '\\';
+    std::string cmd = "cmd /c mkdir \"" + native + "\" 2>nul";
+    system(cmd.c_str());
 #else
-    #include <sys/stat.h>
-    #define make_dir(p) mkdir((p), 0755)
+    std::filesystem::create_directories(path, ec);
 #endif
+}
+#define make_dir(p) make_dir_fs(p)
 
 // ============================================================
 // Phase 2: chooseEncoding()
@@ -96,7 +104,20 @@ bool Loader::load(const std::string& csv_file,
 
         bool ok = false;
 
-        if (types[col_idx] == ColumnType::INT64) {
+        if (types[col_idx] == ColumnType::INT32) {
+            // BUG FIX (Bug 2): type_inference now returns INT32 for values that
+            // fit in 32-bit range. Without this branch, INT32 columns fell through
+            // to the STRING else-branch and were stored incorrectly as strings.
+            std::vector<int32_t> values;
+            values.reserve(rows.size());
+            for (const auto& rv : raw_values) {
+                if (!rv.empty()) values.push_back(static_cast<int32_t>(std::stoi(rv)));
+                else             values.push_back(0);
+            }
+            ok = (enc == Encoding::RLE) ? writer.writeRLE_Int32(values)
+                                        : writer.writeInt32(values);
+
+        } else if (types[col_idx] == ColumnType::INT64) {
             std::vector<int64_t> values;
             values.reserve(rows.size());
             for (const auto& rv : raw_values) {

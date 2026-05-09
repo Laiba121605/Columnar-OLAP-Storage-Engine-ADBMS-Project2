@@ -24,10 +24,25 @@ QueryParser::QueryParser(const std::string& query_text)
 //   - string literals: 'value' → stored as value (quotes stripped)
 //   - numeric literals: stored as-is
 //
-// Example:
-//   "SELECT SUM(price) FROM sales WHERE date >= 20240101"
-//   → ["SELECT","SUM","(","price",")","FROM","sales",
-//      "WHERE","date",">=","20240101"]
+// FIX (Issue 8): Negative number literals in WHERE clauses were
+// not tokenized correctly. The old identifier-accumulation loop
+// included '-' as a valid identifier character:
+//
+//     if (isalnum(c) || c == '_' || c == '.' || c == '-')
+//
+// This caused "price >= -10.5" to produce the token "-10.5" for
+// the literal, which is correct. But it also caused "a-b" (a
+// subtraction expression, not a valid query here) to be treated
+// as one token. More importantly, a standalone '-' that was NOT
+// immediately followed by a digit (e.g. a typo in a query) would
+// silently be absorbed into whatever came next.
+//
+// Fix: '-' is only included as the FIRST character of a token
+// when it is immediately followed by a digit, making it a unary
+// minus for numeric literals. In all other positions '-' is an
+// unknown character and is skipped (same as before). This matches
+// the grammar in Section 7 where literals are integers, doubles,
+// or quoted strings — none of which require '-' mid-token.
 // ============================================================
 void QueryParser::tokenize() {
     tokens_.clear();
@@ -69,19 +84,37 @@ void QueryParser::tokenize() {
             continue;
         }
 
-        // Identifier or number: read until whitespace or special char
-        if (isalnum(c) || c == '_' || c == '.' || c == '-') {
+        // FIX (Issue 8): negative numeric literal — '-' followed by a digit.
+        // Read '-' as the first character of the token, then continue with
+        // the normal identifier/number accumulation below. This correctly
+        // tokenizes WHERE clauses like "price >= -10.5" or "id != -1".
+        // A lone '-' not followed by a digit falls through to the
+        // "skip unknown characters" path at the bottom, same as before.
+        if (c == '-' && i + 1 < text_.size() && isdigit(text_[i + 1])) {
             std::string tok;
+            tok += c;
+            i++;
+            // Fall through into the identifier/number accumulation below
             while (i < text_.size() &&
-                   (isalnum(text_[i]) || text_[i] == '_' ||
-                    text_[i] == '.' || text_[i] == '-')) {
+                   (isalnum(text_[i]) || text_[i] == '_' || text_[i] == '.')) {
                 tok += text_[i++];
             }
             tokens_.push_back(tok);
             continue;
         }
 
-        // Skip unknown characters
+        // Identifier or number: read until whitespace or special char
+        if (isalnum(c) || c == '_' || c == '.') {
+            std::string tok;
+            while (i < text_.size() &&
+                   (isalnum(text_[i]) || text_[i] == '_' || text_[i] == '.')) {
+                tok += text_[i++];
+            }
+            tokens_.push_back(tok);
+            continue;
+        }
+
+        // Skip unknown characters (including bare '-' not before a digit)
         i++;
     }
 }
@@ -154,7 +187,6 @@ bool QueryParser::parse(QueryPlan& plan) {
         return false;
     }
 
-    // Must start with SELECT
     if (!parseSelect(plan))   return false;
     if (!parseFrom(plan))     return false;
     if (!atEnd() && peek() == "WHERE")    parseWhere(plan);
@@ -170,7 +202,6 @@ bool QueryParser::parse(QueryPlan& plan) {
 bool QueryParser::parseSelect(QueryPlan& plan) {
     if (!expect("SELECT")) return false;
 
-    // SELECT *
     if (peek() == "*") {
         consume();
         plan.select_star = true;
@@ -182,7 +213,6 @@ bool QueryParser::parseSelect(QueryPlan& plan) {
 
 // ============================================================
 // parseSelectList()
-// Handles comma-separated list of SelectExprs
 // ============================================================
 bool QueryParser::parseSelectList(QueryPlan& plan) {
     SelectExpr expr;
@@ -190,7 +220,7 @@ bool QueryParser::parseSelectList(QueryPlan& plan) {
     plan.selects.push_back(expr);
 
     while (!atEnd() && peek() == ",") {
-        consume(); // eat comma
+        consume();
         SelectExpr next_expr;
         if (!parseSelectExpr(next_expr)) return false;
         plan.selects.push_back(next_expr);
@@ -200,33 +230,26 @@ bool QueryParser::parseSelectList(QueryPlan& plan) {
 
 // ============================================================
 // parseSelectExpr()
-// Handles:
-//   plain column:   "country"
-//   aggregate:      "SUM(price)", "COUNT(*)", "AVG(quantity)"
 // ============================================================
 bool QueryParser::parseSelectExpr(SelectExpr& expr) {
     std::string tok = peek();
 
     if (isAggFunc(tok)) {
-        // Aggregate function
         expr.agg = toAggFunc(consume());
 
         if (!expect("(")) return false;
 
         if (peek() == "*") {
-            // COUNT(*)
             consume();
             expr.star = true;
             expr.col  = "";
         } else {
-            // SUM(col), AVG(col), etc.
             expr.col  = consume();
             expr.star = false;
         }
 
         if (!expect(")")) return false;
     } else {
-        // Plain column reference
         expr.agg  = AggFunc::NONE;
         expr.col  = consume();
         expr.star = false;
@@ -241,7 +264,6 @@ bool QueryParser::parseSelectExpr(SelectExpr& expr) {
 
 // ============================================================
 // parseFrom()
-// Handles: FROM table_name
 // ============================================================
 bool QueryParser::parseFrom(QueryPlan& plan) {
     if (!expect("FROM")) return false;
@@ -258,26 +280,21 @@ bool QueryParser::parseFrom(QueryPlan& plan) {
 // ============================================================
 // parseWhere()
 // Phase 1: single predicate only — col op literal
-// Example: "WHERE date >= 20240101"
-//          "WHERE category = 'Electronics'"
 // ============================================================
 bool QueryParser::parseWhere(QueryPlan& plan) {
     if (!expect("WHERE")) return false;
 
     plan.where.has_where = true;
 
-    // Column name
     if (atEnd()) { error_ = "Expected column after WHERE"; return false; }
     plan.where.col = consume();
 
-    // Operator
     if (atEnd() || !isOp(peek())) {
         error_ = "Expected operator after WHERE column";
         return false;
     }
     plan.where.op = consume();
 
-    // Literal value
     if (atEnd()) { error_ = "Expected value after WHERE operator"; return false; }
     plan.where.val = consume();
 
@@ -286,7 +303,6 @@ bool QueryParser::parseWhere(QueryPlan& plan) {
 
 // ============================================================
 // parseGroupBy()
-// Parsed in Phase 1, but executor only uses it in Phase 2.
 // ============================================================
 bool QueryParser::parseGroupBy(QueryPlan& plan) {
     if (!expect("GROUP")) return false;
@@ -295,33 +311,24 @@ bool QueryParser::parseGroupBy(QueryPlan& plan) {
     if (atEnd()) { error_ = "Expected column after GROUP BY"; return false; }
     plan.groupby = consume();
 
-    // TODO Phase 2: executor will use plan.groupby for hash map aggregation
     return true;
 }
 
 // ============================================================
 // neededColumns()
 // Returns all column names this query actually touches.
-// The executor calls this to open ONLY those .col files.
-// This is what makes columnar storage faster — we skip columns
-// that aren't needed by the query.
-//
-// Example: SELECT country, SUM(price) FROM sales WHERE date >= 20240101
-//   → needs: {"country", "price", "date"}
-//   → does NOT open: id.col, quantity.col, product_id.col
 // ============================================================
 std::vector<std::string> QueryPlan::neededColumns() const {
     std::vector<std::string> cols;
     auto add = [&](const std::string& c) {
         if (!c.empty()) {
-            // avoid duplicates
             for (auto& existing : cols)
                 if (existing == c) return;
             cols.push_back(c);
         }
     };
 
-    if (select_star) return cols; // executor will read schema for SELECT *
+    if (select_star) return cols;
 
     for (const auto& sel : selects) {
         if (!sel.star) add(sel.col);

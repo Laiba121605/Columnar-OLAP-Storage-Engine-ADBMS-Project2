@@ -1,27 +1,42 @@
 #include "../include/column_writer.h"
 #include "../include/common.h"
 #include <iostream>
-#include <cstdio>
 #include <fstream>
 #include <vector>
 #include <unordered_map>
 #include <algorithm>
 
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+
+// ============================================================
+// FILE* shim for Windows. std::ofstream::open() fails on freshly
+// compiled executables due to AV scanning. FILE* (C runtime) works.
+// ============================================================
 #ifdef _WIN32
-    #include <windows.h>
+#  define CW_WRITE(p,n)  (fwrite((p),1,(size_t)(n),fp_))
+#  define CW_FAIL()      (fp_==nullptr||ferror(fp_)!=0)
+#  define CW_SEEKP(o)    fseek(fp_,static_cast<long>(o),SEEK_SET)
+#  define CW_FLUSH()     fflush(fp_)
+#  define CW_CLOSE()     do{if(fp_){fclose(fp_);fp_=nullptr;}}while(0)
+#  define CW_ISOPEN()    (fp_!=nullptr)
 #else
-    #include <sys/stat.h>
-    #include <unistd.h>
+#  define CW_WRITE(p,n)  file_.write(reinterpret_cast<const char*>(p),(n))
+#  define CW_FAIL()      file_.fail()
+#  define CW_SEEKP(o)    file_.seekp(o)
+#  define CW_FLUSH()     file_.flush()
+#  define CW_CLOSE()     do{if(file_.is_open())file_.close();}while(0)
+#  define CW_ISOPEN()    file_.is_open()
 #endif
 
-// Cross-platform directory creation
 static void ensure_dir(const std::string& dir) {
+    std::string native = dir;
 #ifdef _WIN32
-    std::string cmd = "mkdir \"" + dir + "\" 2> nul";
-#else
-    std::string cmd = "mkdir -p \"" + dir + "\"";
+    for (char& c : native) if (c == '/') c = '\\';
 #endif
-    system(cmd.c_str());
+    std::error_code ec;
+    std::filesystem::create_directories(native, ec);
 }
 
 ColumnWriter::ColumnWriter(const std::string& table_dir,
@@ -41,22 +56,36 @@ ColumnWriter::ColumnWriter(const std::string& table_dir,
 }
 
 ColumnWriter::~ColumnWriter() {
-    if (file_.is_open()) file_.close();
+    CW_CLOSE();
 }
+
 
 bool ColumnWriter::openFile() {
-    size_t slash = filepath_temp_.find_last_of("/\\");
-    if (slash != std::string::npos)
-        ensure_dir(filepath_temp_.substr(0, slash));
-
-    file_.open(filepath_temp_, std::ios::binary);
+    std::string path = filepath_temp_;
+#ifdef _WIN32
+    for (char& c : path) if (c == '/') c = '\\';
+    size_t sl = path.find_last_of("\\/");
+    if (sl != std::string::npos) {
+        std::string parent = path.substr(0, sl);
+        std::string cmd = "cmd /c mkdir \"" + parent + "\" >nul 2>&1";
+        system(cmd.c_str());
+    }
+    fp_ = fopen(path.c_str(), "wb");
+    return fp_ != nullptr;
+#else
+    size_t sl = path.find_last_of("/\\");
+    if (sl != std::string::npos)
+        ensure_dir(path.substr(0, sl));
+    file_.open(path, std::ios::binary);
     return file_.is_open();
+#endif
 }
+
 
 bool ColumnWriter::writeHeader() {
     if (header_written_) return true;   // guard: never write header twice
 
-    if (!file_.is_open())
+    if (!CW_ISOPEN())
         if (!openFile()) return false;
 
     // Header layout matches Section 4 exactly (36 bytes total).
@@ -72,8 +101,8 @@ bool ColumnWriter::writeHeader() {
     header.data_size = 0;   // patched in closeAndRename()
     header.dict_size = 0;   // patched in closeAndRename()
 
-    file_.write(reinterpret_cast<const char*>(&header), sizeof(ColumnHeader));
-    if (file_.fail()) return false;
+    CW_WRITE(&header, sizeof(ColumnHeader));
+    if (CW_FAIL()) return false;
 
     header_written_ = true;
     return true;
@@ -82,24 +111,24 @@ bool ColumnWriter::writeHeader() {
 // ── Raw write helpers (Phase 1, still used in Phase 2 for non-encoded cols) ──
 
 void ColumnWriter::writeInt32Raw(int32_t value) {
-    file_.write(reinterpret_cast<const char*>(&value), sizeof(int32_t));
+    CW_WRITE(&value, sizeof(int32_t));
     data_size_written_ += sizeof(int32_t);
 }
 
 void ColumnWriter::writeInt64Raw(int64_t value) {
-    file_.write(reinterpret_cast<const char*>(&value), sizeof(int64_t));
+    CW_WRITE(&value, sizeof(int64_t));
     data_size_written_ += sizeof(int64_t);
 }
 
 void ColumnWriter::writeDoubleRaw(double value) {
-    file_.write(reinterpret_cast<const char*>(&value), sizeof(double));
+    CW_WRITE(&value, sizeof(double));
     data_size_written_ += sizeof(double);
 }
 
 void ColumnWriter::writeStringRaw(const std::string& value) {
     uint16_t len = static_cast<uint16_t>(value.size());
-    file_.write(reinterpret_cast<const char*>(&len), sizeof(uint16_t));
-    file_.write(value.c_str(), len);
+    CW_WRITE(&len, sizeof(uint16_t));
+    CW_WRITE(value.c_str(), len);
     data_size_written_ += sizeof(uint16_t) + len;
 }
 
@@ -109,25 +138,25 @@ void ColumnWriter::setRowCount(size_t count) { row_count_ = count; }
 
 bool ColumnWriter::writeInt32(const std::vector<int32_t>& values) {
     if (!writeHeader()) return false;
-    for (int32_t v : values) { writeInt32Raw(v); if (file_.fail()) return false; }
+    for (int32_t v : values) { writeInt32Raw(v); if (CW_FAIL()) return false; }
     return true;
 }
 
 bool ColumnWriter::writeInt64(const std::vector<int64_t>& values) {
     if (!writeHeader()) return false;
-    for (int64_t v : values) { writeInt64Raw(v); if (file_.fail()) return false; }
+    for (int64_t v : values) { writeInt64Raw(v); if (CW_FAIL()) return false; }
     return true;
 }
 
 bool ColumnWriter::writeDouble(const std::vector<double>& values) {
     if (!writeHeader()) return false;
-    for (double v : values) { writeDoubleRaw(v); if (file_.fail()) return false; }
+    for (double v : values) { writeDoubleRaw(v); if (CW_FAIL()) return false; }
     return true;
 }
 
 bool ColumnWriter::writeString(const std::vector<std::string>& values) {
     if (!writeHeader()) return false;
-    for (const auto& v : values) { writeStringRaw(v); if (file_.fail()) return false; }
+    for (const auto& v : values) { writeStringRaw(v); if (CW_FAIL()) return false; }
     return true;
 }
 
@@ -139,8 +168,8 @@ bool ColumnWriter::writeString(const std::vector<std::string>& values) {
 // the same decode logic for both raw strings and dictionary entries.
 void ColumnWriter::writeDictEntry(const std::string& s) {
     uint16_t len = static_cast<uint16_t>(s.size());
-    file_.write(reinterpret_cast<const char*>(&len), sizeof(uint16_t));
-    file_.write(s.c_str(), len);
+    CW_WRITE(&len, sizeof(uint16_t));
+    CW_WRITE(s.c_str(), len);
     dict_size_written_ += sizeof(uint16_t) + len;
 }
 
@@ -153,14 +182,14 @@ void ColumnWriter::writeDictEntry(const std::string& s) {
 void ColumnWriter::writeDictId(uint32_t id, uint8_t id_width) {
     if (id_width == 1) {
         uint8_t v = static_cast<uint8_t>(id);
-        file_.write(reinterpret_cast<const char*>(&v), 1);
+        CW_WRITE(&v, 1);
         data_size_written_ += 1;
     } else if (id_width == 2) {
         uint16_t v = static_cast<uint16_t>(id);
-        file_.write(reinterpret_cast<const char*>(&v), 2);
+        CW_WRITE(&v, 2);
         data_size_written_ += 2;
     } else {
-        file_.write(reinterpret_cast<const char*>(&id), 4);
+        CW_WRITE(&id, 4);
         data_size_written_ += 4;
     }
 }
@@ -218,7 +247,7 @@ bool ColumnWriter::writeDictionary(const std::vector<std::string>& values) {
     // ── Step 4: write data section (ids) ──
     for (const auto& v : values) {
         writeDictId(str_to_id[v], id_width);
-        if (file_.fail()) return false;
+        if (CW_FAIL()) return false;
     }
 
     // ── Step 5: write dictionary section ──
@@ -227,7 +256,7 @@ bool ColumnWriter::writeDictionary(const std::vector<std::string>& values) {
     dict_size_written_ = 0;
     for (const auto& s : id_to_str) {
         writeDictEntry(s);
-        if (file_.fail()) return false;
+        if (CW_FAIL()) return false;
     }
 
     return true;
@@ -279,10 +308,10 @@ bool ColumnWriter::writeRLE_Int64(const std::vector<int64_t>& values) {
             run++;
         }
         // Write value (8 bytes) then run_length (8 bytes, uint64_t)
-        file_.write(reinterpret_cast<const char*>(&val), sizeof(int64_t));
-        file_.write(reinterpret_cast<const char*>(&run), sizeof(uint64_t));
+        CW_WRITE(&val, sizeof(int64_t));
+        CW_WRITE(&run, sizeof(uint64_t));
         data_size_written_ += sizeof(int64_t) + sizeof(uint64_t);
-        if (file_.fail()) return false;
+        if (CW_FAIL()) return false;
         i += run;
     }
 
@@ -323,10 +352,10 @@ bool ColumnWriter::writeRLE_Double(const std::vector<double>& values) {
         while (i + run < values.size() && values[i + run] == val) {
             run++;
         }
-        file_.write(reinterpret_cast<const char*>(&val), sizeof(double));
-        file_.write(reinterpret_cast<const char*>(&run), sizeof(uint64_t));
+        CW_WRITE(&val, sizeof(double));
+        CW_WRITE(&run, sizeof(uint64_t));
         data_size_written_ += sizeof(double) + sizeof(uint64_t);
-        if (file_.fail()) return false;
+        if (CW_FAIL()) return false;
         i += run;
     }
 
@@ -340,52 +369,61 @@ bool ColumnWriter::writeRLE_Double(const std::vector<double>& values) {
 // renames .col.tmp -> .col.
 // ─────────────────────────────────────────────────────────────────────────────
 bool ColumnWriter::closeAndRename() {
-    if (!file_.is_open()) return true;
+    if (!CW_ISOPEN()) return true;   // nothing was written
 
-    // Patch data_size at byte offset 20
-    file_.seekp(20, std::ios::beg);
-    file_.write(reinterpret_cast<const char*>(&data_size_written_), sizeof(uint64_t));
-    if (file_.fail()) return false;
+    // Patch data_size at header offset 20
+    CW_SEEKP(20);
+    CW_WRITE(&data_size_written_, sizeof(uint64_t));
+    if (CW_FAIL()) return false;
 
-    // Phase 2: patch dict_size at byte offset 28
-    file_.seekp(28, std::ios::beg);
-    file_.write(reinterpret_cast<const char*>(&dict_size_written_), sizeof(uint64_t));
-    if (file_.fail()) return false;
+    // Patch dict_size at header offset 28
+    CW_SEEKP(28);
+    CW_WRITE(&dict_size_written_, sizeof(uint64_t));
+    if (CW_FAIL()) return false;
 
-    // Compute CRC64 over entire file, append as footer
-    file_.flush();
-    file_.close();
+    CW_FLUSH();
+    CW_CLOSE();
 
-    std::ifstream readback(filepath_temp_, std::ios::binary);
-    if (!readback.is_open()) {
-        std::cerr << "CRC: cannot reopen temp file: " << filepath_temp_ << "\n";
+    // Normalize path for Windows
+    std::string tmp_path  = filepath_temp_;
+    std::string final_path = filepath_final_;
+#ifdef _WIN32
+    for (char& c : tmp_path)   if (c == '/') c = '\\';
+    for (char& c : final_path) if (c == '/') c = '\\';
+#endif
+
+    // Read entire temp file to compute CRC64
+    FILE* rf = fopen(tmp_path.c_str(), "rb");
+    if (!rf) {
+        std::cerr << "CRC: cannot reopen temp file: " << tmp_path << "\n";
         return false;
     }
-    std::vector<char> buf((std::istreambuf_iterator<char>(readback)),
-                           std::istreambuf_iterator<char>());
-    readback.close();
+    fseek(rf, 0, SEEK_END);
+    long fsz = ftell(rf);
+    fseek(rf, 0, SEEK_SET);
+    std::vector<char> buf(fsz);
+    fread(buf.data(), 1, fsz, rf);
+    fclose(rf);
 
     uint64_t crc = crc64(buf.data(), buf.size());
 
-    std::ofstream append(filepath_temp_, std::ios::binary | std::ios::app);
-    if (!append.is_open()) {
-        std::cerr << "CRC: cannot append to temp file: " << filepath_temp_ << "\n";
+    // Append CRC footer
+    FILE* af = fopen(tmp_path.c_str(), "ab");
+    if (!af) {
+        std::cerr << "CRC: cannot append to temp file: " << tmp_path << "\n";
         return false;
     }
-    append.write(reinterpret_cast<const char*>(&crc), sizeof(uint64_t));
-    append.close();
+    fwrite(&crc, 1, sizeof(uint64_t), af);
+    fclose(af);
 
-    // Atomic rename temp -> final
-    // Phase 2 note: same Windows fix as schema.cpp — remove destination first
+    // Rename temp -> final
 #ifdef _WIN32
-    std::remove(filepath_final_.c_str());
+    std::remove(final_path.c_str());
 #endif
-    if (std::rename(filepath_temp_.c_str(), filepath_final_.c_str()) != 0) {
-        std::cerr << "Error renaming " << filepath_temp_
-                  << " -> " << filepath_final_ << "\n";
+    if (std::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+        std::cerr << "Error renaming " << tmp_path << " -> " << final_path << "\n";
         return false;
     }
-
     return true;
 }
 

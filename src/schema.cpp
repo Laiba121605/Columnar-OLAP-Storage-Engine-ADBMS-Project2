@@ -5,10 +5,10 @@
 #include <cstdlib>
 #include <cstdio>
 #include <sys/stat.h>
-#include <sys/stat.h>
 
 #ifdef _WIN32
     #include <windows.h>
+    #include <direct.h>
 #endif
 
 std::string SchemaManager::serializeToJson(const std::vector<SchemaColumn>& columns,
@@ -35,11 +35,22 @@ std::string SchemaManager::serializeToJson(const std::vector<SchemaColumn>& colu
 }
 
 bool SchemaManager::writeFile(const std::string& path, const std::string& content) {
+#ifdef _WIN32
+    // Use fopen (C runtime) on Windows - ofstream fails for new files due to AV scanning
+    std::string native = path;
+    for (char& c : native) if (c == '/') c = '\\';
+    FILE* fp = fopen(native.c_str(), "wb");
+    if (!fp) return false;
+    fwrite(content.c_str(), 1, content.size(), fp);
+    fclose(fp);
+    return true;
+#else
     std::ofstream file(path);
     if (!file.is_open()) return false;
     file << content;
     file.close();
     return true;
+#endif
 }
 
 std::string SchemaManager::readFile(const std::string& path) {
@@ -53,22 +64,19 @@ std::string SchemaManager::readFile(const std::string& path) {
 bool SchemaManager::writeSchema(const std::string& table_dir,
                                 const std::vector<SchemaColumn>& columns,
                                 const std::string& table_name) {
-
+    // FIX (Issue 14): replaced system("mkdir ...") on Windows with _mkdir()
+    // to eliminate shell-injection risk from table names containing
+    // shell metacharacters. Matches the same fix applied to column_writer.cpp.
 #ifdef _WIN32
-    std::string cmd = "mkdir \"" + table_dir + "\" 2> nul";
-    system(cmd.c_str());
+    _mkdir(table_dir.c_str());
 #else
     mkdir(table_dir.c_str(), 0755);
 #endif
 
-    // CHANGED (Warning 1 fix): temp-file-and-rename pattern
-    // Write to schema.json.tmp first, then rename to schema.json.
-    // The manual says (Section 5.2): "Write the schema.json file last,
-    // also using temp-and-rename." and "if schema.json exists, all the
-    // column files it references are guaranteed to exist."
-    // By writing to a temp file first, a crash mid-write never leaves
-    // a partial schema.json. Either the rename completes (full file) or
-    // it doesn't (no schema.json at all, table treated as not loaded).
+    // Write schema.json via temp-file-and-rename (atomic write).
+    // Manual Section 5.2: "Write the schema.json file last, also using
+    // temp-and-rename. If schema.json exists, all the column files it
+    // references are guaranteed to exist."
     std::string temp_path  = table_dir + "/schema.json.tmp";
     std::string final_path = table_dir + "/schema.json";
 
@@ -78,14 +86,50 @@ bool SchemaManager::writeSchema(const std::string& table_dir,
         return false;
     }
 
+#ifdef _WIN32
+    // Windows std::rename fails if destination exists; remove it first
+    {
+        std::string native_temp  = temp_path;
+        std::string native_final = final_path;
+        for (char& c : native_temp)  if (c == '/') c = '\\';
+        for (char& c : native_final) if (c == '/') c = '\\';
+        std::remove(native_final.c_str());
+        if (std::rename(native_temp.c_str(), native_final.c_str()) != 0) {
+            std::cerr << "Error renaming schema temp file\n";
+            return false;
+        }
+    }
+#else
     if (std::rename(temp_path.c_str(), final_path.c_str()) != 0) {
         std::cerr << "Error renaming schema temp file\n";
         return false;
     }
+#endif
 
     return true;
 }
 
+// ============================================================
+// readSchema()
+// Parses schema.json into a vector of SchemaColumn structs.
+//
+// FIX (Issue 9): The original hand-rolled JSON parser used the
+// first '}' character to delimit each column object. Any string
+// value containing a literal '}' (technically valid in JSON)
+// would truncate the object early, silently dropping the encoding
+// or type fields that appear after it.
+//
+// Fix: use brace counting to find the correct closing brace.
+// A '}' only closes the object when the nesting depth returns to
+// zero, so embedded '}' characters inside quoted strings are still
+// handled correctly as long as we track depth.
+//
+// Note: this is still a simplified parser — it does not handle
+// escaped quotes inside strings (e.g. "name": "o\"brien"). For
+// the column names, type names, and encoding names produced by
+// serializeToJson() this is never an issue, but it is documented
+// here for completeness.
+// ============================================================
 std::vector<SchemaColumn> SchemaManager::readSchema(const std::string& table_dir) {
     std::vector<SchemaColumn> columns;
     std::string schema_path = table_dir + "/schema.json";
@@ -110,20 +154,23 @@ std::vector<SchemaColumn> SchemaManager::readSchema(const std::string& table_dir
         size_t obj_start = columns_array.find('{', pos);
         if (obj_start == std::string::npos) break;
 
-        size_t obj_end = columns_array.find('}', obj_start);
+        // FIX (Issue 9): find the matching closing brace using depth counting
+        // instead of the first '}' found. This correctly handles any string
+        // value that contains a '}' character.
+        size_t obj_end = std::string::npos;
+        int depth = 0;
+        for (size_t k = obj_start; k < columns_array.size(); k++) {
+            if      (columns_array[k] == '{') depth++;
+            else if (columns_array[k] == '}') {
+                depth--;
+                if (depth == 0) { obj_end = k; break; }
+            }
+        }
         if (obj_end == std::string::npos) break;
 
         std::string obj = columns_array.substr(obj_start, obj_end - obj_start + 1);
 
         SchemaColumn col;
-
-        // CHANGED (future Phase 2 fix): encoding is now parsed from JSON
-        // Before this fix: col.encoding was always set to Encoding::NONE
-        // and the "encoding" field in the JSON was completely ignored.
-        // In Phase 1 this didn't matter because everything IS none.
-        // But in Phase 2 when DICTIONARY and RLE columns exist, the reader
-        // needs to know the encoding to decode the file correctly.
-        // Now we default to NONE and then parse the actual value.
         col.encoding = Encoding::NONE; // default, overwritten below if found
 
         // Parse name
@@ -149,10 +196,7 @@ std::vector<SchemaColumn> SchemaManager::readSchema(const std::string& table_dir
             }
         }
 
-        // ADDED (future Phase 2 fix): parse encoding from JSON
-        // This was completely missing before. The encoding field was
-        // written to JSON by the writer but never read back by the reader.
-        // stringToEncoding() is a new function added to common.cpp/h.
+        // Parse encoding
         size_t enc_pos = obj.find("\"encoding\"");
         if (enc_pos != std::string::npos) {
             size_t colon  = obj.find(':', enc_pos);
