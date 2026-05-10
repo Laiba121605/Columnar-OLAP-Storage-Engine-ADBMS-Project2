@@ -377,6 +377,7 @@ bool Executor::executeAggregate(const QueryPlan& plan,
                                 const Bitmap& bitmap,
                                 std::vector<ColumnReader*>& readers,
                                 const std::vector<std::string>& colNames) {
+                                    
 
     // Reset all readers
     for (auto* r : readers) r->reset();
@@ -396,6 +397,9 @@ bool Executor::executeAggregate(const QueryPlan& plan,
     }
 
     uint64_t rowCount = getRowCount(readers);
+    uint64_t rows_passing = 0;
+for (bool b : bitmap) if (b) rows_passing++;
+std::cout << "DEBUG: " << rows_passing << " rows pass filter out of " << rowCount << std::endl;
 
     for (uint64_t row = 0; row < rowCount; row++) {
         // Read all column values first to keep readers in sync

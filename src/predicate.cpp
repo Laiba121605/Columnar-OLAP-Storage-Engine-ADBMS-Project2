@@ -75,13 +75,18 @@ Bitmap PredicateEvaluator::evaluateWithReader(const WherePredicate& pred,
 // compareInt64()
 // Converts the literal string to int64 and compares.
 // ============================================================
-bool PredicateEvaluator::compareInt64(int64_t val,
-                                      const std::string& op,
-                                      const std::string& literal) {
+bool PredicateEvaluator::compareInt64(int64_t val, const std::string& op, const std::string& literal) {
     int64_t rhs = 0;
     try { rhs = std::stoll(literal); }
     catch (...) { return false; }
-
+    
+    // Debug
+    static int count = 0;
+    if (count < 5) {
+        std::cout << "DEBUG compareInt64: val=" << val << " op=" << op << " rhs=" << rhs << std::endl;
+        count++;
+    }
+    
     if (op == "=")  return val == rhs;
     if (op == "!=") return val != rhs;
     if (op == "<")  return val <  rhs;

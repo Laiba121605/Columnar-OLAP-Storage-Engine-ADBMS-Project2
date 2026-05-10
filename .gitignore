@@ -16,4 +16,4 @@ DocumentLayout.json
 Browse.VC.db
 
 # Test data (generated at runtime)
-data/
+data/"benchmark_sales.csv" 
