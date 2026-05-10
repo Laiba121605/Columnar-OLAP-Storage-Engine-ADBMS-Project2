@@ -23,12 +23,27 @@ Executor::AggState::AggState(AggFunc f)
 
 void Executor::AggState::update(double val) {
     switch (func) {
-        case AggFunc::COUNT: count++; break;
-        case AggFunc::SUM:   sum += val; break;
-        case AggFunc::AVG:   sum += val; count++; break;
-        case AggFunc::MIN:   if (val < minVal) minVal = val; break;
-        case AggFunc::MAX:   if (val > maxVal) maxVal = val; break;
-        default: break;
+        case AggFunc::COUNT: 
+            count++; 
+            break;
+        case AggFunc::SUM:   
+            sum += val; 
+            count++;  // ← ADD THIS LINE
+            break;
+        case AggFunc::AVG:   
+            sum += val; 
+            count++; 
+            break;
+        case AggFunc::MIN:   
+            if (val < minVal) minVal = val; 
+            count++;  // ← ADD THIS LINE
+            break;
+        case AggFunc::MAX:   
+            if (val > maxVal) maxVal = val; 
+            count++;  // ← ADD THIS LINE
+            break;
+        default: 
+            break;
     }
 }
 
@@ -396,7 +411,7 @@ bool Executor::executeAggregate(const QueryPlan& plan,
             const auto& sel = plan.selects[s];
 
             if (sel.agg == AggFunc::COUNT && sel.star) {
-                states[s].update(0); // COUNT(*) — value doesn't matter
+                states[s].update(0);
             } else if (sel.agg != AggFunc::NONE) {
                 int rIdx = selectToReader[s];
                 if (rIdx >= 0) {
@@ -433,7 +448,6 @@ bool Executor::executeAggregate(const QueryPlan& plan,
     // Print one result row
     for (size_t s = 0; s < plan.selects.size(); s++) {
         const auto& sel = plan.selects[s];
-        // COUNT results print as integers, not floats.
         if (sel.agg == AggFunc::COUNT) {
             std::cout << static_cast<int64_t>(states[s].result());
         } else {
@@ -445,7 +459,6 @@ bool Executor::executeAggregate(const QueryPlan& plan,
 
     return true;
 }
-
 // ============================================================
 // CASE 4: GROUP BY with aggregates
 // Example: SELECT country, SUM(price) FROM sales GROUP BY country

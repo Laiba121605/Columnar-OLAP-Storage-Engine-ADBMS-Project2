@@ -1,0 +1,30 @@
+{
+  "table": "auto_test",
+  "columns": [
+    {
+      "name": "country",
+      "type": "string",
+      "encoding": "dictionary"
+    },
+    {
+      "name": "city",
+      "type": "string",
+      "encoding": "dictionary"
+    },
+    {
+      "name": "date",
+      "type": "int32",
+      "encoding": "none"
+    },
+    {
+      "name": "value",
+      "type": "int32",
+      "encoding": "none"
+    },
+    {
+      "name": "unique_id",
+      "type": "string",
+      "encoding": "dictionary"
+    }
+  ]
+}
